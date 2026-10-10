@@ -1,0 +1,16 @@
+name: CI
+
+# Manual only: the gate is the local run before a PR merges.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build, SIMD and no_std check
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo build --release --features simd
+      - run: cargo check --no-default-features
