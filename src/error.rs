@@ -69,6 +69,10 @@ pub enum ValidationError {
     InvalidDimensions,
     /// Image dimensions exceed supported limits.
     ImageTooLarge,
+    /// Decoded pixel count exceeds the configured limit.
+    PixelLimitExceeded,
+    /// Component planes and reconstruction buffers exceed the byte limit.
+    MemoryLimitExceeded,
     /// Image has too many channels.
     TooManyChannels,
     /// Invalid component metadata.
@@ -179,6 +183,8 @@ impl fmt::Display for ValidationError {
         match self {
             Self::InvalidDimensions => write!(f, "invalid image dimensions"),
             Self::ImageTooLarge => write!(f, "image is too large"),
+            Self::PixelLimitExceeded => write!(f, "decoded pixel limit exceeded"),
+            Self::MemoryLimitExceeded => write!(f, "decoded buffer byte limit exceeded"),
             Self::TooManyChannels => write!(f, "image has too many channels"),
             Self::InvalidComponentMetadata => write!(f, "invalid component metadata"),
             Self::InvalidProgressionOrder => write!(f, "invalid progression order"),
@@ -286,3 +292,4 @@ macro_rules! err {
 
 pub(crate) use bail;
 pub(crate) use err;
+

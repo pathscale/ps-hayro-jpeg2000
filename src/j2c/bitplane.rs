@@ -60,6 +60,28 @@ fn decode_inner(
 ) -> Option<()> {
     bp_buffers.reset();
 
+    // A single contribution is already contiguous in the borrowed input.
+    // Normal mode also concatenates contributions across layers when needed.
+    let mut segments = storage.layers[code_block.layers.clone()].iter()
+        .filter_map(|layer| layer.segments.clone())
+        .flat_map(|range| storage.segments[range].iter());
+    if let Some(segment) = segments.next()
+        && segments.next().is_none()
+    {
+        if segment.idx != 0 || segment.coding_pases != code_block.number_of_coding_passes {
+            return None;
+        }
+        let end = segment.coding_pases.min(ctx.max_coding_passes);
+        let mut decoder = ArithmeticDecoder::new(segment.data);
+        let normal = !ctx.style.selective_arithmetic_coding_bypass
+            && !ctx.style.termination_on_each_pass;
+        return if normal && ctx.can_use_fast_path() {
+            fast_path::handle_coding_passes(0, end, ctx, &mut decoder)
+        } else {
+            handle_coding_passes(0, end, ctx, &mut decoder)
+        };
+    }
+
     let mut last_segment_idx = 0;
     let mut coding_passes = 0;
 

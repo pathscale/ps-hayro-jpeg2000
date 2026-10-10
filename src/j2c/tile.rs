@@ -16,6 +16,7 @@ use crate::reader::BitReader;
 #[derive(Clone, Debug)]
 pub(crate) struct Tile<'a> {
     /// The index of the tile, in row-major order.
+    #[allow(dead_code, reason = "kept for diagnostics and future tile tasks")]
     pub(crate) idx: u32,
     /// The concatenated tile parts that contain all the information for all
     /// constituent codeblocks.
@@ -126,6 +127,26 @@ impl<'a> Tile<'a> {
             mct: header.global_coding_style.mct,
             num_layers: header.global_coding_style.num_layers,
         }
+    }
+
+    /// The tile's exclusive rectangle in the decoded image planes.
+    pub(crate) fn output_rect(&self, header: &Header<'_>) -> IntRect {
+        let size = &header.size_data;
+        let dx = u64::from(size.x_shrink_factor)
+            * u64::from(size.x_resolution_shrink_factor);
+        let dy = u64::from(size.y_shrink_factor)
+            * u64::from(size.y_resolution_shrink_factor);
+        let ox = u64::from(size.image_area_x_offset).div_ceil(dx);
+        let oy = u64::from(size.image_area_y_offset).div_ceil(dy);
+        let x = |v| {
+            u64::from(v).div_ceil(dx).saturating_sub(ox)
+                .min(u64::from(size.image_width())) as u32
+        };
+        let y = |v| {
+            u64::from(v).div_ceil(dy).saturating_sub(oy)
+                .min(u64::from(size.image_height())) as u32
+        };
+        IntRect::from_ltrb(x(self.rect.x0), y(self.rect.y0), x(self.rect.x1), y(self.rect.y1))
     }
 
     pub(crate) fn component_tiles(&self) -> impl Iterator<Item = ComponentTile<'_>> {
@@ -764,6 +785,7 @@ mod tests {
     fn test_jpeg2000_standard_example_b4() {
         let component_size_info_0 = ComponentSizeInfo {
             precision: 8,
+            is_signed: false,
             horizontal_resolution: 1,
             vertical_resolution: 1,
         };
@@ -796,6 +818,7 @@ mod tests {
 
         let component_size_info_1 = ComponentSizeInfo {
             precision: 8,
+            is_signed: false,
             horizontal_resolution: 2,
             vertical_resolution: 2,
         };

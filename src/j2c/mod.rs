@@ -4,6 +4,7 @@ mod build;
 mod codestream;
 mod decode;
 mod idwt;
+mod limits;
 mod mct;
 mod progression;
 mod rect;
@@ -12,11 +13,10 @@ mod tag_tree;
 mod tile;
 
 use super::jp2::ImageBoxes;
-use super::jp2::colr::{ColorSpace, ColorSpecificationBox, EnumeratedColorspace};
 use crate::error::{FormatError, MarkerError, Result, bail};
 use crate::j2c::codestream::markers;
 use crate::reader::BitReader;
-use crate::{DecodeSettings, Image, resolve_alpha_and_color_space};
+use crate::{ColorSpace, DecodeSettings, Image};
 
 use crate::math::{SIMD_WIDTH, SimdBuffer};
 pub(crate) use codestream::Header;
@@ -33,12 +33,18 @@ pub(crate) struct ParsedCodestream<'a> {
 pub struct ComponentData {
     pub(crate) container: SimdBuffer<{ SIMD_WIDTH }>,
     pub(crate) bit_depth: u8,
+    pub(crate) is_signed: bool,
 }
 
 impl ComponentData {
     /// The bit depth of this component.
     pub fn bit_depth(&self) -> u8 {
         self.bit_depth
+    }
+
+    /// Whether this component contains signed samples.
+    pub fn is_signed(&self) -> bool {
+        self.is_signed
     }
 
     /// The decoded samples of this component.
@@ -50,20 +56,17 @@ impl ComponentData {
 pub(crate) fn parse<'a>(stream: &'a [u8], settings: &DecodeSettings) -> Result<Image<'a>> {
     let parsed_codestream = parse_raw(stream, settings)?;
     let header = &parsed_codestream.header;
-    let mut boxes = ImageBoxes::default();
-
-    // If we are just decoding a raw codestream, we assume greyscale or
-    // RGB.
-    let cs = if header.component_infos.len() < 3 {
-        ColorSpace::Enumerated(EnumeratedColorspace::Greyscale)
-    } else {
-        ColorSpace::Enumerated(EnumeratedColorspace::Srgb)
+    let boxes = ImageBoxes::default();
+    let num_channels = u8::try_from(header.component_infos.len())
+        .map_err(|_| crate::ValidationError::TooManyChannels)?;
+    // A raw codestream carries no colour space or opacity definitions.
+    // Preserve all four channels for embedders such as PDF.
+    let color_space = match num_channels {
+        1 => ColorSpace::Gray,
+        3 => ColorSpace::RGB,
+        _ => ColorSpace::Unknown { num_channels },
     };
-
-    boxes.color_specification = Some(ColorSpecificationBox { color_space: cs });
-
-    let (color_space, has_alpha) =
-        resolve_alpha_and_color_space(&boxes, &parsed_codestream.header, settings)?;
+    let has_alpha = false;
 
     Ok(Image {
         codestream: parsed_codestream.data,
@@ -94,3 +97,4 @@ pub(crate) fn parse_raw<'a>(
         data: code_stream_data,
     })
 }
+

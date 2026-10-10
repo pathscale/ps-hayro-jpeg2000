@@ -34,6 +34,8 @@ pub struct DecodedImage<'a> {
     /// The JP2 boxes of the image. In the case of a raw codestream, we
     /// will synthesize the necessary boxes.
     pub(crate) boxes: ImageBoxes,
+    /// Whether opacity samples describe premultiplied colour components.
+    pub(crate) has_premultiplied_alpha: bool,
 }
 
 pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<Image<'a>> {
@@ -75,11 +77,7 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
 
                     match child_box.box_type {
                         r#box::CHANNEL_DEFINITION => {
-                            if cdef::parse(&mut boxes, child_box.data).is_err() && settings.strict {
-                                bail!(FormatError::InvalidBox);
-                            }
-                            // If not strict decoding, just assume default
-                            // configuration.
+                            cdef::parse(&mut boxes, child_box.data)?;
                         }
                         r#box::COLOUR_SPECIFICATION => {
                             colr::parse(&mut boxes, child_box.data)?;
@@ -97,12 +95,7 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
                         r#box::COMPONENT_MAPPING => {
                             cmap::parse(&mut boxes, child_box.data)?;
                         }
-                        _ => {
-                            debug!(
-                                "ignoring header box {}",
-                                r#box::tag_to_string(child_box.box_type)
-                            );
-                        }
+                        _ => {}
                     }
                 }
 
@@ -146,3 +139,4 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
         has_alpha,
     })
 }
+

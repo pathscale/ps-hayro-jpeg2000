@@ -11,11 +11,12 @@ use super::bitplane::{BitPlaneDecodeBuffers, BitPlaneDecodeContext};
 use super::build::{CodeBlock, Decomposition, Layer, Precinct, Segment, SubBand, SubBandType};
 use super::codestream::{ComponentInfo, Header, QuantizationStyle, WaveletTransform};
 use super::idwt::IDWTOutput;
+use super::limits::BufferSizes;
 use super::progression::{ProgressionData, progression_iterator};
 use super::tag_tree::TagNode;
-use super::tile::{ComponentTile, ResolutionTile, Tile};
+use super::tile::Tile;
 use super::{ComponentData, bitplane, build, idwt, mct, segment, tile};
-use crate::error::{DecodingError, Result, TileError, ValidationError, bail};
+use crate::error::{DecodingError, Result, TileError, bail};
 use crate::j2c::segment::MAX_BITPLANE_COUNT;
 use crate::math::SimdBuffer;
 use crate::reader::BitReader;
@@ -25,7 +26,10 @@ pub(crate) fn decode<'a>(
     data: &'a [u8],
     header: &'a Header<'a>,
     ctx: &mut DecoderContext<'a>,
+    settings: &crate::DecodeSettings,
+    palette_components: usize,
 ) -> Result<()> {
+    super::limits::check_image(header, settings)?;
     let mut reader = BitReader::new(data);
     let tiles = tile::parse(&mut reader, header)?;
 
@@ -33,18 +37,10 @@ pub(crate) fn decode<'a>(
         bail!(TileError::Invalid);
     }
 
-    ctx.reset(header, &tiles[0])?;
+    let sizes = BufferSizes::new(header, &tiles, settings, palette_components)?;
+    ctx.reset(header, &sizes);
 
     for tile in &tiles {
-        trace!(
-            "tile {} rect [{},{} {}x{}]",
-            tile.idx,
-            tile.rect.x0,
-            tile.rect.y0,
-            tile.rect.width(),
-            tile.rect.height(),
-        );
-
         let progression_iterator = progression_iterator(tile, header)?;
 
         decode_tile(
@@ -55,13 +51,6 @@ pub(crate) fn decode<'a>(
             &mut ctx.channel_data,
             &mut ctx.storage,
         )?;
-    }
-
-    // Note that this assumes that either all tiles have MCT or none of them.
-    // In theory, only some could have it... But hopefully no such cursed
-    // images exist!
-    if tiles[0].mct {
-        mct::apply_inverse(&mut ctx.channel_data, &tiles[0].component_infos, header)?;
     }
 
     apply_sign_shift(&mut ctx.channel_data, &header.component_infos);
@@ -79,23 +68,23 @@ pub struct DecoderContext<'a> {
 }
 
 impl DecoderContext<'_> {
-    fn reset(&mut self, header: &Header<'_>, initial_tile: &Tile<'_>) -> Result<()> {
-        self.tile_decode_context.reset();
-        self.storage.reset();
-
+    fn reset(&mut self, header: &Header<'_>, sizes: &BufferSizes) {
+        // Drop retained buffers from earlier images before applying this
+        // image's budget. Buffers remain reusable across its tiles.
+        self.tile_decode_context = TileDecodeContext::default();
+        self.storage = DecompositionStorage::default();
         self.channel_data.clear();
-        let sample_count = (header.size_data.image_width() as usize)
-            .checked_mul(header.size_data.image_height() as usize)
-            .ok_or(ValidationError::ImageTooLarge)?;
-        // TODO: SIMD Buffers should be reused across runs!
-        for info in &initial_tile.component_infos {
+        self.storage.coefficients = alloc::vec![0.0; sizes.coefficients];
+        self.tile_decode_context.idwt_output.coefficients = Vec::with_capacity(sizes.output);
+        self.tile_decode_context.idwt_scratch_buffer = Vec::with_capacity(sizes.scratch);
+
+        for info in &header.component_infos {
             self.channel_data.push(ComponentData {
-                container: SimdBuffer::zeros(sample_count),
+                container: SimdBuffer::zeros(sizes.samples),
                 bit_depth: info.size_info.precision,
+                is_signed: info.size_info.is_signed,
             });
         }
-
-        Ok(())
     }
 }
 
@@ -119,7 +108,7 @@ fn decode_tile<'a, 'b>(
 
     // Interleave bitplane decoding, IDWT, and storage for each component tile
     // so we can reuse the coefficient and IDWT buffers.
-    for (idx, component_info) in header.component_infos.iter().enumerate() {
+    for (idx, component_info) in tile.component_infos.iter().enumerate() {
         if idx > 0 {
             let count = storage.tile_decompositions[idx].coefficient_count;
             storage.coefficients[..count].fill(0.0);
@@ -135,16 +124,8 @@ fn decode_tile<'a, 'b>(
             header,
             component_info.wavelet_transform(),
         );
-        // Finally, we store the raw samples for the tile area in the correct
-        // location. Note that in case we have MCT, we are not applying it yet.
-        // It will be applied in the very end once all tiles have been processed.
-        // The reason we do this is that applying MCT requires access to the
-        // data from _all_ components. If we didn't defer this until the end
-        // we would have to collect the IDWT outputs of all components before
-        // applying it. By not applying MCT here, we can get away with doing
-        // IDWT and store on a per-component basis. Thus, we only need to
-        // store one IDWT output at a time, allowing for better reuse of
-        // allocations.
+        // Store each component before reusing the IDWT buffers. Once all
+        // components are stored, MCT can operate on this tile's output region.
         store(
             tile,
             header,
@@ -152,6 +133,10 @@ fn decode_tile<'a, 'b>(
             &mut channel_data[idx],
             component_info,
         );
+    }
+
+    if tile.mct {
+        mct::apply_inverse(channel_data, tile, header)?;
     }
 
     Ok(())
@@ -263,16 +248,6 @@ pub(crate) struct TileDecodeContext {
     pub(crate) bit_plane_decode_context: BitPlaneDecodeContext,
     /// Reusable buffers for decoding bitplanes.
     pub(crate) bit_plane_decode_buffers: BitPlaneDecodeBuffers,
-}
-
-impl TileDecodeContext {
-    fn reset(&mut self) {
-        // This method doesn't do anything, just keeping it there in case
-        // it's needed in the future.
-        // Bitplane decode context and buffers will be reset in the
-        // corresponding methods. IDWT output and scratch buffer will be
-        // overridden on demand, so those don't need to be reset either.
-    }
 }
 
 fn decode_component_tile_bit_planes<'a>(
@@ -412,6 +387,9 @@ fn apply_sign_shift(channel_data: &mut [ComponentData], component_infos: &[Compo
     use crate::math::{Level, dispatch, f32x8};
 
     for (channel, component_info) in channel_data.iter_mut().zip(component_infos.iter()) {
+        if component_info.size_info.is_signed {
+            continue;
+        }
         let offset = (1_u32 << (component_info.size_info.precision - 1)) as f32;
         dispatch!(Level::new(), simd => {
             let offset_v = f32x8::splat(simd, offset);
@@ -423,103 +401,53 @@ fn apply_sign_shift(channel_data: &mut [ComponentData], component_infos: &[Compo
     }
 }
 
-fn store<'a>(
-    tile: &'a Tile<'a>,
+fn store(
+    tile: &Tile<'_>,
     header: &Header<'_>,
     tile_ctx: &mut TileDecodeContext,
     channel_data: &mut ComponentData,
     component_info: &ComponentInfo,
 ) {
-    let idwt_output = &mut tile_ctx.idwt_output;
+    let output = &tile_ctx.idwt_output;
+    if output.rect.width() == 0 || output.rect.height() == 0 {
+        return;
+    }
+    let rect = tile.output_rect(header);
+    let size = &header.size_data;
+    let width = size.image_width() as usize;
+    let source_width = output.rect.width() as usize;
+    let sx = u64::from(size.x_shrink_factor);
+    let sy = u64::from(size.y_shrink_factor);
+    let ox = u64::from(size.image_area_x_offset)
+        .div_ceil(sx * u64::from(size.x_resolution_shrink_factor));
+    let oy = u64::from(size.image_area_y_offset)
+        .div_ceil(sy * u64::from(size.y_resolution_shrink_factor));
+    let cx = u64::from(component_info.size_info.horizontal_resolution);
+    let cy = u64::from(component_info.size_info.vertical_resolution);
 
-    let component_tile = ComponentTile::new(tile, component_info);
-    let resolution_tile = ResolutionTile::new(
-        component_tile,
-        component_info.num_resolution_levels() - 1 - header.skipped_resolution_levels,
-    );
-
-    let (scale_x, scale_y) = (
-        component_info.size_info.horizontal_resolution,
-        component_info.size_info.vertical_resolution,
-    );
-
-    let (image_x_offset, image_y_offset) = (
-        header.size_data.image_area_x_offset,
-        header.size_data.image_area_y_offset,
-    );
-
-    if scale_x == 1 && scale_y == 1 {
-        // If no sub-sampling, use a fast path where we copy rows of coefficients
-        // at once.
-
-        // The rect of the IDWT output corresponds to the rect of the highest
-        // decomposition level of the tile, which is usually not 1:1 aligned
-        // with the actual tile rectangle. We also need to account for the
-        // offset of the reference grid.
-
-        let skip_x = image_x_offset.saturating_sub(idwt_output.rect.x0);
-        let skip_y = image_y_offset.saturating_sub(idwt_output.rect.y0);
-
-        let input_row_iter = idwt_output
-            .coefficients
-            .chunks_exact(idwt_output.rect.width() as usize)
-            .skip(skip_y as usize)
-            .take(idwt_output.rect.height() as usize);
-
-        let output_row_iter = channel_data
-            .container
-            .chunks_exact_mut(header.size_data.image_width() as usize)
-            .skip(resolution_tile.rect.y0.saturating_sub(image_y_offset) as usize);
-
-        for (input_row, output_row) in input_row_iter.zip(output_row_iter) {
-            let input_row = &input_row[skip_x as usize..];
-            let output_row = &mut output_row
-                [resolution_tile.rect.x0.saturating_sub(image_x_offset) as usize..]
-                [..input_row.len()];
-
-            output_row.copy_from_slice(input_row);
-        }
-    } else {
-        let image_width = header.size_data.image_width();
-        let image_height = header.size_data.image_height();
-
-        let x_shrink_factor = header.size_data.x_shrink_factor;
-        let y_shrink_factor = header.size_data.y_shrink_factor;
-
-        let x_offset = header
-            .size_data
-            .image_area_x_offset
-            .div_ceil(x_shrink_factor);
-        let y_offset = header
-            .size_data
-            .image_area_y_offset
-            .div_ceil(y_shrink_factor);
-
-        // Otherwise, copy sample by sample.
-        for y in resolution_tile.rect.y0..resolution_tile.rect.y1 {
-            let relative_y = (y - component_tile.rect.y0) as usize;
-            let reference_grid_y = (scale_y as u32 * y) / y_shrink_factor;
-
-            for x in resolution_tile.rect.x0..resolution_tile.rect.x1 {
-                let relative_x = (x - component_tile.rect.x0) as usize;
-                let reference_grid_x = (scale_x as u32 * x) / x_shrink_factor;
-
-                let sample = idwt_output.coefficients
-                    [relative_y * idwt_output.rect.width() as usize + relative_x];
-
-                for x_position in u32::max(reference_grid_x, x_offset)
-                    ..u32::min(reference_grid_x + scale_x as u32, image_width + x_offset)
-                {
-                    for y_position in u32::max(reference_grid_y, y_offset)
-                        ..u32::min(reference_grid_y + scale_y as u32, image_height + y_offset)
-                    {
-                        let pos = (y_position - y_offset) as usize * image_width as usize
-                            + (x_position - x_offset) as usize;
-
-                        channel_data.container[pos] = sample;
-                    }
-                }
+    for y in rect.y0..rect.y1 {
+        let source_y = ((u64::from(y) + oy) * sy / cy)
+            .clamp(u64::from(output.rect.y0), u64::from(output.rect.y1 - 1));
+        let source_row = (source_y as usize - output.rect.y0 as usize) * source_width;
+        let output_row = y as usize * width;
+        if sx == cx {
+            let source_x = (u64::from(rect.x0) + ox)
+                .saturating_sub(u64::from(output.rect.x0)) as usize;
+            let count = rect.width() as usize;
+            if source_x + count <= source_width {
+                channel_data.container[output_row + rect.x0 as usize..][..count]
+                    .copy_from_slice(&output.coefficients[source_row + source_x..][..count]);
+                continue;
             }
+        }
+        // Expand subsampled components only inside this tile's output region.
+        // This prevents a neighbouring tile's samples being transformed twice.
+        for x in rect.x0..rect.x1 {
+            let source_x = ((u64::from(x) + ox) * sx / cx)
+                .clamp(u64::from(output.rect.x0), u64::from(output.rect.x1 - 1));
+            channel_data.container[output_row + x as usize] =
+                output.coefficients[source_row + source_x as usize - output.rect.x0 as usize];
         }
     }
 }
+

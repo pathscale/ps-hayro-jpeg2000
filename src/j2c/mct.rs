@@ -3,13 +3,14 @@
 
 use super::ComponentData;
 use super::codestream::{Header, WaveletTransform};
+use super::tile::Tile;
 use crate::error::{ColorError, Result, bail, err};
-use crate::math::{Level, Simd, dispatch, f32x8};
+use crate::math::{self, Level, Simd, dispatch, f32x8};
 
 /// Apply the inverse multi-component transform, as specified in G.2 and G.3.
 pub(crate) fn apply_inverse(
     components: &mut [ComponentData],
-    component_infos: &[super::codestream::ComponentInfo],
+    tile: &Tile<'_>,
     header: &Header<'_>,
 ) -> Result<()> {
     if components.len() < 3 {
@@ -23,6 +24,7 @@ pub(crate) fn apply_inverse(
     let (s, _) = components.split_at_mut(3);
     let [s0, s1, s2] = s else { unreachable!() };
 
+    let component_infos = &tile.component_infos;
     let transform = component_infos[0].wavelet_transform();
 
     if transform != component_infos[1].wavelet_transform()
@@ -31,16 +33,32 @@ pub(crate) fn apply_inverse(
         bail!(ColorError::Mct);
     }
 
+    if component_infos[..3].iter().any(|info| {
+        info.num_resolution_levels() != component_infos[0].num_resolution_levels()
+            || info.size_info.horizontal_resolution != component_infos[0].size_info.horizontal_resolution
+            || info.size_info.vertical_resolution != component_infos[0].size_info.vertical_resolution
+            || info.size_info.precision != component_infos[0].size_info.precision
+    }) {
+        bail!(ColorError::Mct);
+    }
+
     if s0.container.len() != s1.container.len() || s1.container.len() != s2.container.len() {
         bail!(ColorError::Mct);
     }
 
-    apply_inner(
-        transform,
-        &mut s0.container,
-        &mut s1.container,
-        &mut s2.container,
-    );
+    // MCT is tile-local. Do not touch padding or another tile's samples.
+    let rect = tile.output_rect(header);
+    let width = header.size_data.image_width() as usize;
+    let count = rect.width() as usize;
+    for y in rect.y0..rect.y1 {
+        let start = y as usize * width + rect.x0 as usize;
+        apply_inner(
+            transform,
+            &mut s0.container[start..start + count],
+            &mut s1.container[start..start + count],
+            &mut s2.container[start..start + count],
+        );
+    }
 
     Ok(())
 }
@@ -102,4 +120,25 @@ fn apply_inner_impl<S: Simd>(
             }
         }
     }
+    let remainder = s0.len() / 8 * 8;
+    for i in remainder..s0.len() {
+        let y0 = s0[i];
+        let y1 = s1[i];
+        let y2 = s2[i];
+        let (i0, i1, i2) = match transform {
+            WaveletTransform::Irreversible97 => (
+                math::mul_add(y2, 1.402, y0),
+                math::mul_add(y2, -0.71414, math::mul_add(y1, -0.34413, y0)),
+                math::mul_add(y1, 1.772, y0),
+            ),
+            WaveletTransform::Reversible53 => {
+                let green = y0 - math::floor_f32((y2 + y1) * 0.25);
+                (y2 + green, green, y1 + green)
+            }
+        };
+        s0[i] = i0;
+        s1[i] = i1;
+        s2[i] = i2;
+    }
 }
+

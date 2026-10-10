@@ -54,12 +54,10 @@ Overall, you should expect this crate to have worse performance than `OpenJPEG`,
 but the difference gap should not be too large.
 
 # Safety
-By default, the crate has the `simd` feature enabled, which uses the
-[`fearless_simd`](https://github.com/linebender/fearless_simd) crate to accelerate
-important parts of the pipeline. If you want to eliminate any usage of unsafe
-in this crate as well as its dependencies, you can simply disable this
-feature, at the cost of worse decoding performance. Unsafe code is forbidden
-via a crate-level attribute.
+The default `std` feature adds no dependencies. With
+`default-features = false`, the decoder uses only `core` and `alloc`.
+The optional `simd` feature enables `fearless_simd`. Unsafe code is forbidden
+in this crate via a crate-level attribute.
 
 The crate is `no_std` compatible but requires an allocator to be available.
 */
@@ -70,20 +68,19 @@ The crate is `no_std` compatible but requires an allocator to be available.
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::{bail, err};
 use crate::j2c::Header;
 use crate::jp2::ImageBoxes;
-use crate::jp2::cdef::{ChannelAssociation, ChannelType};
+
 use crate::jp2::cmap::ComponentMappingType;
 use crate::jp2::colr::{CieLab, EnumeratedColorspace};
 use crate::jp2::icc::ICCMetadata;
 
 pub mod error;
-#[macro_use]
-pub(crate) mod log;
 pub(crate) mod math;
 
 use crate::math::{Level, SIMD_WIDTH, Simd, dispatch, f32x8};
@@ -125,6 +122,14 @@ pub struct DecodeSettings {
     pub strict: bool,
     /// A hint for the target resolution that the image should be decoded at.
     pub target_resolution: Option<(u32, u32)>,
+    /// Maximum number of decoded image pixels.
+    pub max_pixels: u64,
+    /// Maximum bytes for component planes, coefficient storage, IDWT output
+    /// and scratch, including the peak planes needed for palette expansion.
+    ///
+    /// Compressed input, packet metadata, code-block scratch and caller-owned
+    /// packed output are excluded.
+    pub max_bytes: u64,
 }
 
 impl Default for DecodeSettings {
@@ -133,6 +138,8 @@ impl Default for DecodeSettings {
             resolve_palette_indices: true,
             strict: false,
             target_resolution: None,
+            max_pixels: 1 << 28,
+            max_bytes: 1 << 31,
         }
     }
 }
@@ -171,6 +178,14 @@ impl<'a> Image<'a> {
         self.has_alpha
     }
 
+    /// Whether the alpha channel describes premultiplied colour samples.
+    ///
+    /// The decoder reports this representation without unpremultiplying it.
+    pub fn has_premultiplied_alpha(&self) -> bool {
+        self.has_alpha && self.boxes.channel_definition.as_ref()
+            .is_some_and(|cdef| cdef.has_premultiplied_alpha())
+    }
+
     /// The color space of the image.
     pub fn color_space(&self) -> &ColorSpace {
         &self.color_space
@@ -199,10 +214,18 @@ impl<'a> Image<'a> {
         decoder_context: &'b mut DecoderContext<'a>,
     ) -> Result<DecodedImage<'b>> {
         let settings = &self.settings;
-        j2c::decode(self.codestream, &self.header, decoder_context)?;
+        let palette_components = if settings.resolve_palette_indices && self.boxes.palette.is_some() {
+            self.boxes.component_mapping.as_ref().map_or(0, |mapping| mapping.entries.len())
+        } else {
+            0
+        };
+        j2c::decode(
+            self.codestream, &self.header, decoder_context, settings, palette_components,
+        )?;
         let mut decoded_image = DecodedImage {
             decoded_components: &mut decoder_context.channel_data,
             boxes: self.boxes.clone(),
+            has_premultiplied_alpha: self.has_premultiplied_alpha(),
         };
 
         // Resolve palette indices.
@@ -212,24 +235,10 @@ impl<'a> Image<'a> {
                 resolve_palette_indices(components, &decoded_image.boxes)?;
         }
 
-        if let Some(cdef) = &decoded_image.boxes.channel_definition {
-            // Sort by the channel association. Note that this will only work if
-            // each component is referenced only once.
-            let mut components = decoded_image
-                .decoded_components
-                .iter()
-                .cloned()
-                .zip(
-                    cdef.channel_definitions
-                        .iter()
-                        .map(|c| match c._association {
-                            ChannelAssociation::WholeImage => u16::MAX,
-                            ChannelAssociation::Colour(c) => c,
-                        }),
-                )
-                .collect::<Vec<_>>();
-            components.sort_by(|c1, c2| c1.1.cmp(&c2.1));
-            *decoded_image.decoded_components = components.into_iter().map(|c| c.0).collect();
+        if (settings.resolve_palette_indices || decoded_image.boxes.palette.is_none())
+            && let Some(cdef) = &decoded_image.boxes.channel_definition
+        {
+            cdef.reorder(decoded_image.decoded_components)?;
         }
 
         // Note that this is only valid if all images have the same bit depth.
@@ -245,61 +254,43 @@ pub(crate) fn resolve_alpha_and_color_space(
     header: &Header<'_>,
     settings: &DecodeSettings,
 ) -> Result<(ColorSpace, bool)> {
-    let mut num_components = header.component_infos.len();
-
-    // Override number of components with what is actually in the palette box
-    // in case we resolve them.
-    if settings.resolve_palette_indices
-        && let Some(palette_box) = &boxes.palette
-    {
-        num_components = palette_box.columns.len();
-    }
-
-    let mut has_alpha = false;
-
+    let actual_num_components = header.component_infos.len();
+    let defined_components = if boxes.palette.is_some() {
+        boxes.component_mapping.as_ref()
+            .ok_or(ColorError::PaletteResolutionFailed)?.entries.len()
+    } else {
+        actual_num_components
+    };
     if let Some(cdef) = &boxes.channel_definition {
-        let last = cdef.channel_definitions.last().unwrap();
-        has_alpha = last.channel_type == ChannelType::Opacity;
+        cdef.permutation(defined_components)?;
     }
 
-    let mut color_space = get_color_space(boxes, num_components)?;
-
-    // If we didn't resolve palette indices, we need to assume grayscale image.
+    let num_components = if settings.resolve_palette_indices && boxes.palette.is_some() {
+        defined_components
+    } else {
+        actual_num_components
+    };
+    if num_components == 0 || num_components > u8::MAX as usize {
+        bail!(ValidationError::TooManyChannels);
+    }
+    let mut has_alpha = boxes.channel_definition.as_ref().is_some_and(|cdef| cdef.has_alpha());
     if !settings.resolve_palette_indices && boxes.palette.is_some() {
         has_alpha = false;
-        color_space = ColorSpace::Gray;
+        return Ok((ColorSpace::Gray, has_alpha));
     }
 
-    let actual_num_components = header.component_infos.len();
-
-    // Validate the number of channels.
-    if boxes.palette.is_none()
-        && actual_num_components
-            != (color_space.num_channels() + if has_alpha { 1 } else { 0 }) as usize
-    {
-        if !settings.strict
-            && actual_num_components == color_space.num_channels() as usize + 1
-            && !has_alpha
-        {
-            // See OPENJPEG test case orb-blue10-lin-j2k. Assume that we have an
-            // alpha channel in this case.
-            has_alpha = true;
-        } else {
-            // Color space is invalid, attempt to repair.
-            if actual_num_components == 1 || (actual_num_components == 2 && has_alpha) {
-                color_space = ColorSpace::Gray;
-            } else if actual_num_components == 3 {
-                color_space = ColorSpace::RGB;
-            } else if actual_num_components == 4 {
-                if has_alpha {
-                    color_space = ColorSpace::RGB;
-                } else {
-                    color_space = ColorSpace::CMYK;
-                }
-            } else {
-                bail!(ValidationError::TooManyChannels);
-            }
-        }
+    let colour_components = num_components - usize::from(has_alpha);
+    let mut color_space = get_color_space(boxes, colour_components)?;
+    if color_space.num_channels() as usize != colour_components {
+        // Opacity is authoritative only when a CDEF marks it.
+        color_space = match colour_components {
+            1 => ColorSpace::Gray,
+            3 => ColorSpace::RGB,
+            4 => ColorSpace::CMYK,
+            _ => ColorSpace::Unknown {
+                num_channels: colour_components as u8,
+            },
+        };
     }
 
     Ok((color_space, has_alpha))
@@ -322,7 +313,7 @@ pub enum ColorSpace {
     /// An image based on an ICC profile.
     Icc {
         /// The raw data of the ICC profile.
-        profile: Vec<u8>,
+        profile: Arc<[u8]>,
         /// The number of channels used by the ICC profile.
         num_channels: u8,
     },
@@ -374,7 +365,38 @@ impl DecodedImage<'_> {
         self.decoded_components
     }
 
+    /// Whether the alpha channel describes premultiplied colour samples.
+    pub fn has_premultiplied_alpha(&self) -> bool {
+        self.has_premultiplied_alpha
+    }
+
+    /// Return interleaved unsigned 16-bit samples, scaled per component,
+    /// rounded to nearest and clamped. Signed ranges are biased to unsigned.
+    pub fn data_u16(&self) -> Vec<u16> {
+        let components = self.components();
+        let buffer_size = components[0].samples().len() * components.len();
+        let mut buf = vec![0; buffer_size];
+        self.store_u16_into(&mut buf);
+        buf
+    }
+
+    /// Store scaled unsigned 16-bit samples into an exactly sized buffer.
+    /// Signed ranges are biased to unsigned; planar samples remain signed.
+    pub fn store_u16_into(&self, buf: &mut [u16]) {
+        let components = self.components();
+        let count = components[0].samples().len();
+        assert_eq!(buf.len(), count * components.len());
+        for (index, component) in components.iter().enumerate() {
+            let (offset, scale) = component_conversion(component, 65535.0);
+            for (sample, &value) in component.samples().iter().enumerate() {
+                buf[sample * components.len() + index] =
+                    math::round_f32(((value + offset) * scale).clamp(0.0, 65535.0)) as u16;
+            }
+        }
+    }
+
     /// Return the decoded image as interleaved unsigned 8-bit sample data.
+    /// Signed ranges are biased to unsigned; planar samples remain signed.
     pub fn data_u8(&self) -> Vec<u8> {
         let components = self.components();
         let buffer_size = components[0].samples().len() * components.len();
@@ -405,9 +427,12 @@ fn interleave_and_convert(image: &DecodedImage<'_>, buf: &mut [u8]) {
 
     let max_len = components[0].container.truncated().len();
 
+    assert_eq!(buf.len(), max_len * num_components);
     let mut output_iter = buf.iter_mut();
 
-    if all_same_bit_depth == Some(8) && num_components <= 4 {
+    if all_same_bit_depth == Some(8) && num_components <= 4
+        && components.iter().all(|component| !component.is_signed)
+    {
         // Fast path for the common case.
         match num_components {
             // Gray-scale.
@@ -472,18 +497,25 @@ fn interleave_and_convert(image: &DecodedImage<'_>, buf: &mut [u8]) {
             _ => unreachable!(),
         }
     } else {
-        // Slow path that also requires us to scale to 8 bit.
-        let mul_factor = ((1 << 8) - 1) as f32;
-
-        for sample in 0..max_len {
-            for channel in components.iter() {
-                *output_iter.next().unwrap() = math::round_f32(
-                    (channel.container[sample] / ((1_u32 << channel.bit_depth) - 1) as f32)
-                        * mul_factor,
-                ) as u8;
+        // Compute each component's conversion once, then write its samples.
+        for (index, component) in components.iter().enumerate() {
+            let (offset, scale) = component_conversion(component, 255.0);
+            for (sample, &value) in component.samples().iter().enumerate() {
+                buf[sample * num_components + index] =
+                    math::round_f32(((value + offset) * scale).clamp(0.0, 255.0)) as u8;
             }
         }
     }
+}
+
+fn component_conversion(component: &ComponentData, maximum: f32) -> (f32, f32) {
+    let offset = if component.is_signed {
+        (1_u64 << (component.bit_depth - 1)) as f32
+    } else {
+        0.0
+    };
+    let scale = maximum / ((1_u64 << component.bit_depth) - 1) as f32;
+    (offset, scale)
 }
 
 fn convert_color_space(image: &mut DecodedImage<'_>, bit_depth: u8) -> Result<()> {
@@ -530,7 +562,7 @@ fn get_color_space(boxes: &ImageBoxes, num_components: usize) -> Result<ColorSpa
                 EnumeratedColorspace::RommRgb => {
                     // Use an ICC profile to process the RommRGB color space.
                     ColorSpace::Icc {
-                        profile: include_bytes!("../assets/ProPhoto-v2-micro.icc").to_vec(),
+                        profile: Arc::from(include_bytes!("../assets/ProPhoto-v2-micro.icc").as_slice()),
                         num_channels: 3,
                     }
                 }
@@ -538,7 +570,7 @@ fn get_color_space(boxes: &ImageBoxes, num_components: usize) -> Result<ColorSpa
                 EnumeratedColorspace::Greyscale => ColorSpace::Gray,
                 EnumeratedColorspace::Sycc => ColorSpace::RGB,
                 EnumeratedColorspace::CieLab(_) => ColorSpace::Icc {
-                    profile: include_bytes!("../assets/LAB.icc").to_vec(),
+                    profile: Arc::from(include_bytes!("../assets/LAB.icc").as_slice()),
                     num_channels: 3,
                 },
                 _ => bail!(FormatError::Unsupported),
@@ -599,6 +631,9 @@ fn resolve_palette_indices(
                     .get(column_idx)
                     .ok_or(ColorError::PaletteResolutionFailed)?;
 
+                if column_info.bit_depth > 31 {
+                    bail!(ColorError::PaletteResolutionFailed);
+                }
                 let mut mapped =
                     Vec::with_capacity(component.container.truncated().len() + SIMD_WIDTH);
 
@@ -614,6 +649,7 @@ fn resolve_palette_indices(
                 resolved.push(ComponentData {
                     container: math::SimdBuffer::new(mapped),
                     bit_depth: column_info.bit_depth,
+                    is_signed: false,
                 });
             }
         }

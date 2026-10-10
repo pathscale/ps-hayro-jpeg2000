@@ -1,6 +1,6 @@
 //! The color specification box (colr), defined in I.5.3.3.
 
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 
 use crate::error::{FormatError, Result};
 use crate::jp2::ImageBoxes;
@@ -34,7 +34,7 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
             )
         }
         2 => {
-            let profile_data = reader.tail().ok_or(FormatError::InvalidBox)?.to_vec();
+            let profile_data = Arc::from(reader.tail().ok_or(FormatError::InvalidBox)?);
             ColorSpace::Icc(profile_data)
         }
         _ => ColorSpace::Unknown,
@@ -55,7 +55,7 @@ pub(crate) struct ColorSpecificationBox {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ColorSpace {
     Enumerated(EnumeratedColorspace),
-    Icc(Vec<u8>),
+    Icc(Arc<[u8]>),
     Unknown,
 }
 
@@ -141,3 +141,4 @@ impl EnumeratedColorspace {
         }
     }
 }
+
