@@ -94,8 +94,6 @@ pub use error::{
 pub use j2c::{ComponentData, DecoderContext};
 pub use jp2::DecodedImage;
 
-#[cfg(feature = "image")]
-pub mod integration;
 mod j2c;
 mod jp2;
 pub(crate) mod reader;

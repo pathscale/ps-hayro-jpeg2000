@@ -1,48 +1,38 @@
 [package]
-name = "hayro-jpeg2000"
-version = "0.4.1"
-description = "A memory-safe, pure-Rust JPEG 2000 decoder."
-authors = { workspace = true }
-edition = { workspace = true }
-rust-version = { workspace = true }
-repository = { workspace = true }
-license = { workspace = true }
+name = "ps-hayro-jpeg2000"
+version = "0.5.0"
+description = "A memory-safe, pure-Rust JPEG 2000 decoder: pathscale fork of hayro-jpeg2000."
+authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>", "PathScale"]
+edition = "2024"
+rust-version = "1.92"
+repository = "https://github.com/pathscale/ps-hayro-jpeg2000"
+license = "Apache-2.0 OR MIT"
 readme = "README.md"
-exclude = ["/tests/", "/manifest_*.json", "/sync.py", "/TESTS.md", "/benches/"]
+keywords = ["jpeg2000", "jp2", "image", "decoder", "no_std"]
+categories = ["multimedia::images", "no-std"]
+
+[lib]
+name = "hayro_jpeg2000"
 
 [dependencies]
-log = { workspace = true, optional = true }
-fearless_simd = { workspace = true, optional = true }
-image = { workspace = true, default-features = false, optional = true }
-moxcms = { workspace = true, optional = true }
+fearless_simd = { version = "1.0.0", optional = true }
 
 [features]
-default = ["std", "simd", "image"]
+default = ["std"]
 # Enable std library support. Disable for no_std environments.
 std = []
 # Enable SIMD via `fearless_simd`.
 simd = ["fearless_simd", "std"]
-# Integration with the `image` crate.
-image = ["dep:image", "dep:moxcms", "std"]
-# Enable logging via the `log` crate.
-logging = ["dep:log"]
 
-[lints]
-workspace = true
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-image = { workspace = true, default-features = false, features = ["png"] }
-indicatif = { version = "0.17", features = ["rayon"] }
-rayon = "1.11"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[[test]]
-name = "asset_suite"
-path = "tests/mod.rs"
-harness = false
-
-[[bench]]
-name = "decode"
-harness = false
+[lints.rust]
+keyword_idents_2024 = "forbid"
+non_ascii_idents = "forbid"
+non_local_definitions = "forbid"
+unsafe_op_in_unsafe_fn = "forbid"
+elided_lifetimes_in_paths = "warn"
+missing_docs = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
