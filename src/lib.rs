@@ -686,17 +686,17 @@ fn cielab_to_rgb<S: Simd>(
     let ra = lab.ra.unwrap_or(170);
     let rb = lab.rb.unwrap_or(200);
     let ol = lab.ol.unwrap_or(0);
-    let oa = lab.oa.unwrap_or(1 << (bit_depth - 1));
+    let oa = lab.oa.unwrap_or(1_u32 << (bit_depth - 1));
     let ob = lab
         .ob
-        .unwrap_or((1 << (bit_depth - 2)) + (1 << (bit_depth - 3)));
+        .unwrap_or((1_u32 << (bit_depth - 2)) + (1_u32 << (bit_depth - 3)));
 
     // Copied from OpenJPEG.
-    let min_l = -(rl as f32 * ol as f32) / ((1 << prec0) - 1) as f32;
+    let min_l = -(rl as f32 * ol as f32) / ((1_u64 << prec0) - 1) as f32;
     let max_l = min_l + rl as f32;
-    let min_a = -(ra as f32 * oa as f32) / ((1 << prec1) - 1) as f32;
+    let min_a = -(ra as f32 * oa as f32) / ((1_u64 << prec1) - 1) as f32;
     let max_a = min_a + ra as f32;
-    let min_b = -(rb as f32 * ob as f32) / ((1 << prec2) - 1) as f32;
+    let min_b = -(rb as f32 * ob as f32) / ((1_u64 << prec2) - 1) as f32;
     let max_b = min_b + rb as f32;
 
     let bit_max = (1_u32 << bit_depth) - 1;
@@ -704,9 +704,9 @@ fn cielab_to_rgb<S: Simd>(
     // Note that we are not doing the actual conversion with the ICC profile yet,
     // just decoding the raw LAB values.
     // We leave applying the ICC profile to the user.
-    let divisor_l = ((1 << prec0) - 1) as f32;
-    let divisor_a = ((1 << prec1) - 1) as f32;
-    let divisor_b = ((1 << prec2) - 1) as f32;
+    let divisor_l = ((1_u64 << prec0) - 1) as f32;
+    let divisor_a = ((1_u64 << prec1) - 1) as f32;
+    let divisor_b = ((1_u64 << prec2) - 1) as f32;
 
     let scale_l_final = bit_max as f32 / 100.0;
     let scale_ab_final = bit_max as f32 / 255.0;
