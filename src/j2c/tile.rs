@@ -162,6 +162,10 @@ pub(crate) fn parse<'a>(
     main_header: &'a Header<'a>,
 ) -> Result<Vec<Tile<'a>>> {
     let tile_count = main_header.size_data.num_tiles()?;
+    // SOT tile indices are 16-bit; reject an unaddressable reference grid.
+    if tile_count > 65_536 {
+        return Err(ValidationError::ImageTooLarge.into());
+    }
     let mut tiles = (0..tile_count)
         .map(|idx| Tile::new(idx, main_header))
         .collect::<Vec<_>>();
