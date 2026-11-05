@@ -5,6 +5,9 @@ name: Publish
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubicloud-standard-2
