@@ -235,15 +235,17 @@ impl<'a> Image<'a> {
                 resolve_palette_indices(components, &decoded_image.boxes)?;
         }
 
-        if (settings.resolve_palette_indices || decoded_image.boxes.palette.is_none())
-            && let Some(cdef) = &decoded_image.boxes.channel_definition
-        {
-            cdef.reorder(decoded_image.decoded_components)?;
-        }
+        let apply_postprocessing =
+            settings.resolve_palette_indices || decoded_image.boxes.palette.is_none();
+        if apply_postprocessing {
+            if let Some(cdef) = &decoded_image.boxes.channel_definition {
+                cdef.reorder(decoded_image.decoded_components)?;
+            }
 
-        // Note that this is only valid if all images have the same bit depth.
-        let bit_depth = decoded_image.decoded_components[0].bit_depth;
-        convert_color_space(&mut decoded_image, bit_depth)?;
+            // Note that this is only valid if all images have the same bit depth.
+            let bit_depth = decoded_image.decoded_components[0].bit_depth;
+            convert_color_space(&mut decoded_image, bit_depth)?;
+        }
 
         Ok(decoded_image)
     }
@@ -812,4 +814,96 @@ fn sycc_to_rgb<S: Simd>(simd: S, components: &mut [ComponentData], bit_depth: u8
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod raw_palette_index_tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{ColorSpace, DecodeSettings, DecoderContext, Image};
+
+    fn push_box(box_type: &[u8; 4], payload: &[u8], output: &mut Vec<u8>) {
+        let length = u32::try_from(payload.len() + 8).unwrap();
+        output.extend_from_slice(&length.to_be_bytes());
+        output.extend_from_slice(box_type);
+        output.extend_from_slice(payload);
+    }
+
+    fn sycc_palette_jp2() -> Vec<u8> {
+        let mut output = vec![
+            0, 0, 0, 12, b'j', b'P', b' ', b' ', 13, 10, 135, 10,
+            0, 0, 0, 20, b'f', b't', b'y', b'p',
+            b'j', b'p', b' ', b' ', 0, 0, 0, 0,
+            b'j', b'p', b' ', b' ',
+        ];
+
+        let mut header = Vec::new();
+        // One unsigned 8-bit component, 1x1 image, JPEG 2000 compression.
+        push_box(b"ihdr", &[0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 7, 7, 0, 0], &mut header);
+        // Enumerated sYCC (method 1, enumerated colour space 18).
+        push_box(b"colr", &[1, 0, 0, 0, 0, 0, 18], &mut header);
+        // One unsigned 8-bit row with three palette columns.
+        push_box(b"pclr", &[0, 1, 3, 7, 7, 7, 96, 128, 192], &mut header);
+        // Map component zero to palette columns zero through two.
+        push_box(
+            b"cmap",
+            &[0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 2],
+            &mut header,
+        );
+        push_box(b"jp2h", &header, &mut output);
+
+        let codestream = [
+            0xFF, 0x4F, // SOC
+            0xFF, 0x51, 0x00, 0x29, 0x00, 0x00, // SIZ, Lsiz, Rsiz
+            0x00, 0x00, 0x00, 0x01, // Xsiz
+            0x00, 0x00, 0x00, 0x01, // Ysiz
+            0x00, 0x00, 0x00, 0x00, // XOsiz
+            0x00, 0x00, 0x00, 0x00, // YOsiz
+            0x00, 0x00, 0x00, 0x01, // XTsiz
+            0x00, 0x00, 0x00, 0x01, // YTsiz
+            0x00, 0x00, 0x00, 0x00, // XTOsiz
+            0x00, 0x00, 0x00, 0x00, // YTOsiz
+            0x00, 0x01, 0x07, 0x01, 0x01, // Csiz and unsigned 8-bit component
+            0xFF, 0x52, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0xFF, 0x5C, 0x00, 0x04, 0x40, 0x40,
+            0xFF, 0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x01,
+            0xFF, 0x93, 0x00, 0xFF, 0xD9,
+        ];
+        push_box(b"jp2c", &codestream, &mut output);
+        output
+    }
+
+    #[test]
+    fn raw_palette_indices_skip_cdef_and_colr_but_mapped_indices_convert() {
+        let data = sycc_palette_jp2();
+        let raw_settings = DecodeSettings {
+            resolve_palette_indices: false,
+            ..DecodeSettings::default()
+        };
+        let raw_image = Image::new(&data, &raw_settings).unwrap();
+        assert!(matches!(raw_image.color_space(), ColorSpace::Gray));
+        assert!(!raw_image.has_alpha());
+        let mut raw_context = DecoderContext::default();
+        let raw_decoded = raw_image.decode(&mut raw_context).unwrap();
+        assert!(!raw_decoded.has_premultiplied_alpha());
+        assert_eq!(raw_decoded.components().len(), 1);
+        assert_eq!(raw_decoded.components()[0].bit_depth(), 8);
+        assert!(!raw_decoded.components()[0].is_signed());
+        assert_eq!(raw_decoded.components()[0].samples(), &[128.0]);
+
+        let mapped_settings = DecodeSettings::default();
+        let mapped_image = Image::new(&data, &mapped_settings).unwrap();
+        assert!(matches!(mapped_image.color_space(), ColorSpace::RGB));
+        assert!(!mapped_image.has_alpha());
+        let mut mapped_context = DecoderContext::default();
+        let mapped_decoded = mapped_image.decode(&mut mapped_context).unwrap();
+        assert!(!mapped_decoded.has_premultiplied_alpha());
+        assert_eq!(mapped_decoded.components().len(), 3);
+        let rgb = mapped_decoded.data_u8();
+        for (actual, expected) in rgb.iter().zip([186_u8, 50, 96]) {
+            assert!(actual.abs_diff(expected) <= 1);
+        }
+    }
 }
