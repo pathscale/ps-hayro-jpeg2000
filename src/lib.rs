@@ -270,7 +270,9 @@ pub(crate) fn resolve_alpha_and_color_space(
     } else {
         actual_num_components
     };
-    if num_components == 0 || num_components > u8::MAX as usize {
+    if num_components == 0 || num_components > u8::MAX as usize
+        || actual_num_components > u8::MAX as usize
+    {
         bail!(ValidationError::TooManyChannels);
     }
     let mut has_alpha = boxes.channel_definition.as_ref().is_some_and(|cdef| cdef.has_alpha());
