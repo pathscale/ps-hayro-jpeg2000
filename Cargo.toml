@@ -2,7 +2,6 @@
 name = "ps-hayro-jpeg2000"
 version = "0.5.0"
 publish = ["crates-io"]
-exclude = ["scripts/publish-crate.sh"]
 description = "A memory-safe, pure-Rust JPEG 2000 decoder: pathscale fork of hayro-jpeg2000."
 authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>", "PathScale"]
 edition = "2024"
