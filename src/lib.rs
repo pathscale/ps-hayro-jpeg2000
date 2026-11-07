@@ -715,10 +715,17 @@ fn cielab_to_rgb<S: Simd>(
     let ra = lab.ra.unwrap_or(170);
     let rb = lab.rb.unwrap_or(200);
     let ol = lab.ol.unwrap_or(0);
-    let oa = lab.oa.unwrap_or(1_u32 << (bit_depth - 1));
-    let ob = lab
-        .ob
-        .unwrap_or((1_u32 << (bit_depth - 2)) + (1_u32 << (bit_depth - 3)));
+    let all_unsigned = !l.is_signed && !a.is_signed && !b.is_signed;
+    let oa = lab.oa.unwrap_or(if all_unsigned {
+        1_u32 << (prec1 - 1)
+    } else {
+        1_u32 << (bit_depth - 1)
+    });
+    let ob = lab.ob.unwrap_or(if all_unsigned {
+        (1_u32 << (prec2 - 2)) + (1_u32 << (prec2 - 3))
+    } else {
+        (1_u32 << (bit_depth - 2)) + (1_u32 << (bit_depth - 3))
+    });
 
     // Copied from OpenJPEG.
     let min_l = -(rl as f32 * ol as f32) / ((1_u64 << prec0) - 1) as f32;
@@ -737,15 +744,28 @@ fn cielab_to_rgb<S: Simd>(
     let divisor_a = ((1_u64 << prec1) - 1) as f32;
     let divisor_b = ((1_u64 << prec2) - 1) as f32;
 
-    let scale_l_final = bit_max as f32 / 100.0;
-    let scale_ab_final = bit_max as f32 / 255.0;
+    let scale_l_final = if all_unsigned {
+        ((1_u64 << prec0) - 1) as f32 / 100.0
+    } else {
+        bit_max as f32 / 100.0
+    };
+    let scale_a_final = if all_unsigned {
+        ((1_u64 << prec1) - 1) as f32 / 255.0
+    } else {
+        bit_max as f32 / 255.0
+    };
+    let scale_b_final = if all_unsigned {
+        ((1_u64 << prec2) - 1) as f32 / 255.0
+    } else {
+        bit_max as f32 / 255.0
+    };
 
     let l_offset = min_l * scale_l_final;
     let l_scale = (max_l - min_l) / divisor_l * scale_l_final;
-    let a_offset = (min_a + 128.0) * scale_ab_final;
-    let a_scale = (max_a - min_a) / divisor_a * scale_ab_final;
-    let b_offset = (min_b + 128.0) * scale_ab_final;
-    let b_scale = (max_b - min_b) / divisor_b * scale_ab_final;
+    let a_offset = (min_a + 128.0) * scale_a_final;
+    let a_scale = (max_a - min_a) / divisor_a * scale_a_final;
+    let b_offset = (min_b + 128.0) * scale_b_final;
+    let b_scale = (max_b - min_b) / divisor_b * scale_b_final;
 
     let l_offset_v = f32x8::splat(simd, l_offset);
     let l_scale_v = f32x8::splat(simd, l_scale);
@@ -926,5 +946,196 @@ mod raw_palette_index_tests {
         for (actual, expected) in rgb.iter().zip([186_u8, 50, 96]) {
             assert!(actual.abs_diff(expected) <= 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod unsigned_mixed_precision_lab {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::jp2::colr::{CieLab, ColorSpace as BoxColorSpace, ColorSpecificationBox};
+    use super::math::SimdBuffer;
+    use super::{
+        get_color_space, ColorSpace, ComponentData, DecodedImage, ImageBoxes, SIMD_WIDTH,
+    };
+
+    fn component(samples: &[f32], bit_depth: u8, is_signed: bool) -> ComponentData {
+        ComponentData {
+            container: SimdBuffer::<SIMD_WIDTH>::new(samples.to_vec()),
+            bit_depth,
+            is_signed,
+        }
+    }
+
+    fn fixture<'a>(components: &'a mut Vec<ComponentData>, lab: CieLab) -> DecodedImage<'a> {
+        DecodedImage {
+            decoded_components: components,
+            boxes: ImageBoxes {
+                color_specification: Some(ColorSpecificationBox {
+                    color_space: BoxColorSpace::Enumerated(
+                        super::jp2::colr::EnumeratedColorspace::CieLab(lab),
+                    ),
+                }),
+                ..ImageBoxes::default()
+            },
+            has_premultiplied_alpha: false,
+        }
+    }
+
+    fn assert_within_u8(actual: &[u8], expected: &[u8]) {
+        assert_eq!(actual.len(), expected.len());
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            assert!(actual.abs_diff(expected) <= 1, "{actual} != {expected}");
+        }
+    }
+
+    fn assert_within_u16(actual: &[u16], expected: &[u16]) {
+        assert_eq!(actual.len(), expected.len());
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            assert!(actual.abs_diff(expected) <= 1, "{actual} != {expected}");
+        }
+    }
+
+    fn default_lab() -> CieLab {
+        CieLab {
+            rl: None,
+            ol: None,
+            ra: None,
+            oa: None,
+            rb: None,
+            ob: None,
+        }
+    }
+
+    fn convert_and_pack(
+        precisions: [u8; 3],
+        values: [f32; 3],
+        lab: CieLab,
+        bit_depth: u8,
+    ) -> (Vec<u8>, Vec<u16>, [f32; 3]) {
+        let mut components = vec![
+            component(&[values[0]], precisions[0], false),
+            component(&[values[1]], precisions[1], false),
+            component(&[values[2]], precisions[2], false),
+        ];
+        let mut decoded = fixture(&mut components, lab);
+        let original_metadata = decoded
+            .components()
+            .iter()
+            .map(|component| (component.bit_depth(), component.is_signed()))
+            .collect::<Vec<_>>();
+        let before = get_color_space(&decoded.boxes, 3).unwrap();
+        assert!(matches!(before, ColorSpace::Icc { profile, num_channels: 3 }
+            if profile.as_ref() == include_bytes!("../assets/LAB.icc").as_slice()));
+
+        super::convert_color_space(&mut decoded, bit_depth).unwrap();
+
+        let after = get_color_space(&decoded.boxes, 3).unwrap();
+        assert!(matches!(after, ColorSpace::Icc { profile, num_channels: 3 }
+            if profile.as_ref() == include_bytes!("../assets/LAB.icc").as_slice()));
+        assert_eq!(
+            decoded
+                .components()
+                .iter()
+                .map(|component| (component.bit_depth(), component.is_signed()))
+                .collect::<Vec<_>>(),
+            original_metadata
+        );
+        let converted = [
+            decoded.components()[0].samples()[0],
+            decoded.components()[1].samples()[0],
+            decoded.components()[2].samples()[0],
+        ];
+        (decoded.data_u8(), decoded.data_u16(), converted)
+    }
+
+    #[test]
+    fn unsigned_mixed_precision_neutral_and_explicit_offsets_pack_per_channel() {
+        let (u8, u16, _) = convert_and_pack([8, 10, 12], [0.0, 512.0, 1536.0], default_lab(), 8);
+        assert_within_u8(&u8, &[0, 128, 128]);
+        assert_within_u16(&u16, &[0, 32896, 32896]);
+
+        let explicit = CieLab {
+            oa: Some(100),
+            ob: Some(200),
+            ..default_lab()
+        };
+        for (a, b, expected) in [
+            (100.0, 200.0, 128),
+            (100.0 + 1023.0 / 170.0, 200.0 + 4095.0 / 200.0, 129),
+        ] {
+            let (u8, u16, _) = convert_and_pack([8, 10, 12], [0.0, a, b], explicit, 8);
+            assert_within_u8(&u8, &[0, expected, expected]);
+            let expected_u16 = if expected == 128 { 32896 } else { 33153 };
+            assert_within_u16(&u16, &[0, expected_u16, expected_u16]);
+        }
+    }
+
+    #[test]
+    fn unsigned_lab_compatibility_and_trailing_alpha_are_preserved() {
+        let (u8, u16, _) = convert_and_pack([8, 8, 8], [0.0, 128.0, 96.0], default_lab(), 8);
+        assert_within_u8(&u8, &[0, 128, 128]);
+        assert_within_u16(&u16, &[0, 32896, 32896]);
+
+        let neutral_a = (1_u32 << 30) as f32;
+        let neutral_b = ((1_u32 << 29) + (1_u32 << 28)) as f32;
+        let (u8, u16, raw_samples) = convert_and_pack(
+            [31, 31, 31],
+            [0.0, neutral_a, neutral_b],
+            default_lab(),
+            31,
+        );
+        assert!(raw_samples.iter().all(|sample| sample.is_finite()));
+        assert_within_u8(&u8, &[0, 128, 128]);
+        assert_within_u16(&u16, &[0, 32896, 32896]);
+
+        let mut components = vec![
+            component(&[0.0, 100.0], 8, false),
+            component(&[512.0, 512.0], 10, false),
+            component(&[1536.0, 1536.0], 12, false),
+            component(&[3.0, 22.0], 5, false),
+        ];
+        let original_alpha = components[3].samples().to_vec();
+        let mut decoded = fixture(&mut components, default_lab());
+        super::convert_color_space(&mut decoded, 8).unwrap();
+        assert_eq!(decoded.components()[3].samples().to_vec(), original_alpha);
+        assert_eq!(decoded.components()[3].bit_depth(), 5);
+        assert!(!decoded.components()[3].is_signed());
+    }
+
+    #[test]
+    fn signed_lab_keeps_the_prechange_scalar_path() {
+        let precisions = [8_u8, 10, 12];
+        let values = [12.0_f32, 512.0, 1536.0];
+        let bit_depth = 8_u8;
+        let oa = 1_u32 << (bit_depth - 1);
+        let ob = (1_u32 << (bit_depth - 2)) + (1_u32 << (bit_depth - 3));
+        let scalar_expected = [
+            values[0] * (100.0 / 255.0) * (255.0 / 100.0),
+            (-(170.0 * oa as f32) / 1023.0 + 128.0)
+                * (255.0 / 255.0)
+                + values[1] * (170.0 / 1023.0) * (255.0 / 255.0),
+            (-(200.0 * ob as f32) / 4095.0 + 128.0)
+                * (255.0 / 255.0)
+                + values[2] * (200.0 / 4095.0) * (255.0 / 255.0),
+        ];
+
+        let mut components = vec![
+            component(&[values[0]], precisions[0], true),
+            component(&[values[1]], precisions[1], false),
+            component(&[values[2]], precisions[2], true),
+        ];
+        let mut decoded = fixture(&mut components, default_lab());
+        super::convert_color_space(&mut decoded, bit_depth).unwrap();
+        for (index, expected) in scalar_expected.into_iter().enumerate() {
+            assert!((decoded.components()[index].samples()[0] - expected).abs() < 0.001);
+        }
+        assert_eq!(decoded.components()[0].bit_depth(), 8);
+        assert!(decoded.components()[0].is_signed());
+        assert_eq!(decoded.components()[1].bit_depth(), 10);
+        assert!(!decoded.components()[1].is_signed());
+        assert_eq!(decoded.components()[2].bit_depth(), 12);
+        assert!(decoded.components()[2].is_signed());
     }
 }
