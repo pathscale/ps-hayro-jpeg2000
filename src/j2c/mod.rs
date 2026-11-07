@@ -235,6 +235,7 @@ mod recovery_budget_tests {
             let valid_tiles = super::limits::tile_table_bytes(&valid_probe.header, 1).unwrap();
             let exact = valid_tiles
                 + super::limits::raw_plane_bytes(&valid_probe.header, valid_samples).unwrap()
+                + size_of::<super::tile::TilePart<'_>>()
                 + 2 * size_of::<f32>();
             let cap = u64::try_from(exact - 1).unwrap();
             let post_parse_settings = DecodeSettings {
@@ -270,7 +271,8 @@ mod recovery_budget_tests {
             let tile_count = usize::try_from(probe.header.size_data.num_tiles().unwrap()).unwrap();
             let planes = super::limits::raw_plane_bytes(&probe.header, samples).unwrap();
             let tiles = super::limits::tile_table_bytes(&probe.header, tile_count).unwrap();
-            let exact = tiles + planes + 2 * size_of::<f32>();
+            let exact =
+                tiles + planes + size_of::<super::tile::TilePart<'_>>() + 2 * size_of::<f32>();
 
             let exact_settings = DecodeSettings {
                 strict,
@@ -293,6 +295,135 @@ mod recovery_budget_tests {
                 generous_decoded.components()[0].samples(),
                 exact_samples.as_slice()
             );
+        }
+    }
+
+    #[test]
+    fn qcd_overrides_share_the_retained_tile_budget() {
+        const QCD: &[u8] = &[0xFF, 0x5C, 0, 11, 0x42, 0x40, 0, 0x40, 0, 0x40, 0, 0x40, 0];
+        const QCC: &[u8] = &[0xFF, 0x5D, 0, 6, 0, 0x41, 0x40, 0];
+
+        let fixture = |first: &[&[u8]], second: &[&[u8]]| {
+            let mut bytes = unit_fixture(4, &[]);
+            // Two 2x2 tiles with one decomposition and irreversible quantization.
+            bytes[15] = 2; // Ysiz
+            bytes[27] = 2; // XTsiz
+            bytes[31] = 2; // YTsiz
+            bytes[54] = 1; // decomposition levels
+            bytes[58] = 0; // irreversible transform
+            bytes.truncate(bytes.len() - 6);
+            bytes.extend_from_slice(&[0xFF, 0x5C, 0, 5, 0x41, 0x40, 0]);
+
+            for (index, tile_markers) in [first, second].into_iter().enumerate() {
+                let marker_bytes: usize = tile_markers.iter().map(|marker| marker.len()).sum();
+                let part_len = u32::try_from(16 + marker_bytes).unwrap();
+                bytes.extend_from_slice(&[0xFF, 0x90, 0, 10, 0, index as u8]);
+                bytes.extend_from_slice(&part_len.to_be_bytes());
+                bytes.extend_from_slice(&[0, 1]);
+                for marker in tile_markers {
+                    bytes.extend_from_slice(marker);
+                }
+                // SOD and one empty packet per resolution.
+                bytes.extend_from_slice(&[0xFF, 0x93, 0, 0]);
+            }
+            bytes.extend_from_slice(&[0xFF, 0xD9]);
+            bytes
+        };
+
+        let both = fixture(&[QCD], &[QCD]);
+        let first_only = fixture(&[QCD], &[]);
+        let second_only = fixture(&[], &[QCD]);
+        let replaced = fixture(&[QCD, QCC], &[QCD]);
+        for strict in [false, true] {
+            let settings = DecodeSettings {
+                strict,
+                ..DecodeSettings::default()
+            };
+            let probe = Image::new(&both, &settings).unwrap();
+            let inherited = super::limits::tile_table_bytes(&probe.header, 2).unwrap();
+            let planes = super::limits::raw_plane_bytes(&probe.header, 8).unwrap();
+            let baseline = inherited + 2 * size_of::<super::tile::TilePart<'_>>();
+            let growth = 3 * size_of::<super::codestream::StepSize>();
+            let exact = planes + baseline + 2 * growth;
+            let parse = |bytes: &[u8], cap: usize| {
+                let settings = DecodeSettings {
+                    max_bytes: u64::try_from(cap).unwrap(),
+                    ..settings
+                };
+                let image = Image::new(bytes, &settings).unwrap();
+                let mut reader = super::BitReader::new(image.codestream);
+                super::tile::parse(&mut reader, &image.header, inherited, planes, &settings)
+                    .map(|(_, retained)| retained)
+            };
+
+            assert!(matches!(
+                parse(&both, exact - 1),
+                Err(crate::DecodeError::Validation(
+                    ValidationError::MemoryLimitExceeded
+                ))
+            ));
+            assert_eq!(parse(&both, exact).unwrap(), baseline + 2 * growth);
+            for bytes in [&first_only, &second_only, &replaced] {
+                assert_eq!(parse(bytes, exact - growth).unwrap(), baseline + growth);
+            }
+
+            // Four coefficients and a 3x3 padded IDWT output per tile.
+            let decode_cap = exact + (4 + 9) * size_of::<f32>();
+            for cap in [decode_cap - 1, decode_cap] {
+                let settings = DecodeSettings {
+                    max_bytes: u64::try_from(cap).unwrap(),
+                    ..settings
+                };
+                let image = Image::new(&both, &settings).unwrap();
+                let mut context = DecoderContext::default();
+                let result = image.decode(&mut context);
+                if cap == decode_cap {
+                    assert_eq!(result.unwrap().components()[0].samples(), &[128.0; 8]);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(crate::DecodeError::Validation(
+                            ValidationError::MemoryLimitExceeded
+                        ))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discarded_ppt_does_not_consume_the_retained_budget() {
+        // Psot covers only SOT and SOD. The intervening PPT makes the tile
+        // part invalid, so permissive parsing discards it.
+        let body = [
+            0xFF, 0x90, 0, 10, 0, 0, 0, 0, 0, 14, 0, 1, 0xFF, 0x61, 0, 4, 0, 0, 0xFF, 0x93,
+            0xFF, 0xD9,
+        ];
+        let bytes = unit_fixture(1, &body);
+        for strict in [false, true] {
+            let settings = DecodeSettings {
+                strict,
+                ..DecodeSettings::default()
+            };
+            let image = Image::new(&bytes, &settings).unwrap();
+            let inherited = super::limits::tile_table_bytes(&image.header, 1).unwrap();
+            let planes = super::limits::raw_plane_bytes(&image.header, 1).unwrap();
+            let settings = DecodeSettings {
+                max_bytes: u64::try_from(inherited + planes).unwrap(),
+                ..settings
+            };
+            let mut reader = super::BitReader::new(image.codestream);
+            let result = super::tile::parse(&mut reader, &image.header, inherited, planes, &settings);
+            if strict {
+                assert!(matches!(
+                    result,
+                    Err(crate::DecodeError::Tile(crate::TileError::Invalid))
+                ));
+            } else {
+                let (tiles, retained) = result.unwrap();
+                assert!(tiles[0].tile_parts.is_empty());
+                assert_eq!(retained, inherited);
+            }
         }
     }
 
