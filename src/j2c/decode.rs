@@ -45,7 +45,7 @@ pub(crate) fn decode<'a>(
         settings,
     )?;
     let mut reader = BitReader::new(data);
-    let tiles = tile::parse(&mut reader, header)?;
+    let (tiles, tile_bytes) = tile::parse(&mut reader, header, tile_bytes, planes, settings)?;
 
     if tiles.is_empty() {
         bail!(TileError::Invalid);
