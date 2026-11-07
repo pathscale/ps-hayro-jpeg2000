@@ -254,6 +254,17 @@ mod recovery_budget_tests {
         }
     }
 
+    fn single_block_sub_band_bytes() -> usize {
+        use super::build::{CodeBlock, Layer, Precinct, SubBand};
+        use super::tag_tree::TagNode;
+
+        size_of::<SubBand>()
+            + size_of::<Precinct>()
+            + size_of::<CodeBlock>()
+            + size_of::<Layer>()
+            + 2 * size_of::<TagNode>()
+    }
+
     #[test]
     fn valid_empty_packet_exact_boundary_and_generous_cap_succeed_in_both_modes() {
         let body = [
@@ -271,8 +282,25 @@ mod recovery_budget_tests {
             let tile_count = usize::try_from(probe.header.size_data.num_tiles().unwrap()).unwrap();
             let planes = super::limits::raw_plane_bytes(&probe.header, samples).unwrap();
             let tiles = super::limits::tile_table_bytes(&probe.header, tile_count).unwrap();
-            let exact =
-                tiles + planes + size_of::<super::tile::TilePart<'_>>() + 2 * size_of::<f32>();
+            let exact = tiles
+                + planes
+                + size_of::<super::tile::TilePart<'_>>()
+                + 2 * size_of::<f32>()
+                + single_block_sub_band_bytes()
+                + size_of::<super::decode::TileDecompositions>();
+
+            let below_cap = DecodeSettings {
+                max_bytes: u64::try_from(exact - 1).unwrap(),
+                ..generous
+            };
+            let image = Image::new(&bytes, &below_cap).unwrap();
+            let mut context = DecoderContext::default();
+            assert!(matches!(
+                image.decode(&mut context),
+                Err(crate::DecodeError::Validation(
+                    ValidationError::MemoryLimitExceeded
+                ))
+            ));
 
             let exact_settings = DecodeSettings {
                 strict,
@@ -367,8 +395,13 @@ mod recovery_budget_tests {
                 assert_eq!(parse(bytes, exact - growth).unwrap(), baseline + growth);
             }
 
-            // Four coefficients and a 3x3 padded IDWT output per tile.
-            let decode_cap = exact + (4 + 9) * size_of::<f32>();
+            // Each tile has four coefficients, a padded 3x3 IDWT output,
+            // and four sub-bands with one code-block and layer apiece.
+            let decode_cap = exact
+                + (4 + 9) * size_of::<f32>()
+                + 4 * single_block_sub_band_bytes()
+                + size_of::<super::build::Decomposition>()
+                + size_of::<super::decode::TileDecompositions>();
             for cap in [decode_cap - 1, decode_cap] {
                 let settings = DecodeSettings {
                     max_bytes: u64::try_from(cap).unwrap(),
