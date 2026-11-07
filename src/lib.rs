@@ -83,7 +83,7 @@ use crate::jp2::icc::ICCMetadata;
 pub mod error;
 pub(crate) mod math;
 
-use crate::math::{Level, SIMD_WIDTH, Simd, dispatch, f32x8};
+use crate::math::{dispatch, f32x8, Level, Simd, SIMD_WIDTH};
 pub use error::{
     ColorError, DecodeError, DecodingError, FormatError, MarkerError, Result, TileError,
     ValidationError,
@@ -124,10 +124,12 @@ pub struct DecodeSettings {
     pub target_resolution: Option<(u32, u32)>,
     /// Maximum number of decoded image pixels.
     pub max_pixels: u64,
-    /// Maximum bytes for component planes, coefficient storage, IDWT output
-    /// and scratch, including the peak planes needed for palette expansion.
+    /// Maximum estimated bytes for inherited tile-table metadata, component
+    /// planes, coefficient storage, IDWT output and scratch, including the
+    /// peak planes needed for palette expansion.
     ///
-    /// Compressed input, packet metadata, code-block scratch and caller-owned
+    /// Tile-header overrides, allocator overhead, progression metadata,
+    /// compressed input, packet metadata, code-block scratch and caller-owned
     /// packed output are excluded.
     pub max_bytes: u64,
 }
@@ -182,8 +184,12 @@ impl<'a> Image<'a> {
     ///
     /// The decoder reports this representation without unpremultiplying it.
     pub fn has_premultiplied_alpha(&self) -> bool {
-        self.has_alpha && self.boxes.channel_definition.as_ref()
-            .is_some_and(|cdef| cdef.has_premultiplied_alpha())
+        self.has_alpha
+            && self
+                .boxes
+                .channel_definition
+                .as_ref()
+                .is_some_and(|cdef| cdef.has_premultiplied_alpha())
     }
 
     /// The color space of the image.
@@ -214,13 +220,21 @@ impl<'a> Image<'a> {
         decoder_context: &'b mut DecoderContext<'a>,
     ) -> Result<DecodedImage<'b>> {
         let settings = &self.settings;
-        let palette_components = if settings.resolve_palette_indices && self.boxes.palette.is_some() {
-            self.boxes.component_mapping.as_ref().map_or(0, |mapping| mapping.entries.len())
+        let palette_components = if settings.resolve_palette_indices && self.boxes.palette.is_some()
+        {
+            self.boxes
+                .component_mapping
+                .as_ref()
+                .map_or(0, |mapping| mapping.entries.len())
         } else {
             0
         };
         j2c::decode(
-            self.codestream, &self.header, decoder_context, settings, palette_components,
+            self.codestream,
+            &self.header,
+            decoder_context,
+            settings,
+            palette_components,
         )?;
         let mut decoded_image = DecodedImage {
             decoded_components: &mut decoder_context.channel_data,
@@ -258,8 +272,12 @@ pub(crate) fn resolve_alpha_and_color_space(
 ) -> Result<(ColorSpace, bool)> {
     let actual_num_components = header.component_infos.len();
     let defined_components = if boxes.palette.is_some() {
-        boxes.component_mapping.as_ref()
-            .ok_or(ColorError::PaletteResolutionFailed)?.entries.len()
+        boxes
+            .component_mapping
+            .as_ref()
+            .ok_or(ColorError::PaletteResolutionFailed)?
+            .entries
+            .len()
     } else {
         actual_num_components
     };
@@ -272,12 +290,16 @@ pub(crate) fn resolve_alpha_and_color_space(
     } else {
         actual_num_components
     };
-    if num_components == 0 || num_components > u8::MAX as usize
+    if num_components == 0
+        || num_components > u8::MAX as usize
         || actual_num_components > u8::MAX as usize
     {
         bail!(ValidationError::TooManyChannels);
     }
-    let mut has_alpha = boxes.channel_definition.as_ref().is_some_and(|cdef| cdef.has_alpha());
+    let mut has_alpha = boxes
+        .channel_definition
+        .as_ref()
+        .is_some_and(|cdef| cdef.has_alpha());
     if !settings.resolve_palette_indices && boxes.palette.is_some() {
         has_alpha = false;
         return Ok((ColorSpace::Gray, has_alpha));
@@ -434,7 +456,8 @@ fn interleave_and_convert(image: &DecodedImage<'_>, buf: &mut [u8]) {
     assert_eq!(buf.len(), max_len * num_components);
     let mut output_iter = buf.iter_mut();
 
-    if all_same_bit_depth == Some(8) && num_components <= 4
+    if all_same_bit_depth == Some(8)
+        && num_components <= 4
         && components.iter().all(|component| !component.is_signed)
     {
         // Fast path for the common case.
@@ -566,7 +589,9 @@ fn get_color_space(boxes: &ImageBoxes, num_components: usize) -> Result<ColorSpa
                 EnumeratedColorspace::RommRgb => {
                     // Use an ICC profile to process the RommRGB color space.
                     ColorSpace::Icc {
-                        profile: Arc::from(include_bytes!("../assets/ProPhoto-v2-micro.icc").as_slice()),
+                        profile: Arc::from(
+                            include_bytes!("../assets/ProPhoto-v2-micro.icc").as_slice(),
+                        ),
                         num_channels: 3,
                     }
                 }
@@ -816,7 +841,6 @@ fn sycc_to_rgb<S: Simd>(simd: S, components: &mut [ComponentData], bit_depth: u8
     Ok(())
 }
 
-
 #[cfg(test)]
 mod raw_palette_index_tests {
     use alloc::vec;
@@ -833,25 +857,23 @@ mod raw_palette_index_tests {
 
     fn sycc_palette_jp2() -> Vec<u8> {
         let mut output = vec![
-            0, 0, 0, 12, b'j', b'P', b' ', b' ', 13, 10, 135, 10,
-            0, 0, 0, 20, b'f', b't', b'y', b'p',
-            b'j', b'p', b' ', b' ', 0, 0, 0, 0,
-            b'j', b'p', b' ', b' ',
+            0, 0, 0, 12, b'j', b'P', b' ', b' ', 13, 10, 135, 10, 0, 0, 0, 20, b'f', b't', b'y',
+            b'p', b'j', b'p', b' ', b' ', 0, 0, 0, 0, b'j', b'p', b' ', b' ',
         ];
 
         let mut header = Vec::new();
         // One unsigned 8-bit component, 1x1 image, JPEG 2000 compression.
-        push_box(b"ihdr", &[0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 7, 7, 0, 0], &mut header);
+        push_box(
+            b"ihdr",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 7, 7, 0, 0],
+            &mut header,
+        );
         // Enumerated sYCC (method 1, enumerated colour space 18).
         push_box(b"colr", &[1, 0, 0, 0, 0, 0, 18], &mut header);
         // One unsigned 8-bit row with three palette columns.
         push_box(b"pclr", &[0, 1, 3, 7, 7, 7, 96, 128, 192], &mut header);
         // Map component zero to palette columns zero through two.
-        push_box(
-            b"cmap",
-            &[0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 2],
-            &mut header,
-        );
+        push_box(b"cmap", &[0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 2], &mut header);
         push_box(b"jp2h", &header, &mut output);
 
         let codestream = [
@@ -867,9 +889,8 @@ mod raw_palette_index_tests {
             0x00, 0x00, 0x00, 0x00, // YTOsiz
             0x00, 0x01, 0x07, 0x01, 0x01, // Csiz and unsigned 8-bit component
             0xFF, 0x52, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            0xFF, 0x5C, 0x00, 0x04, 0x40, 0x40,
-            0xFF, 0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x01,
-            0xFF, 0x93, 0x00, 0xFF, 0xD9,
+            0xFF, 0x5C, 0x00, 0x04, 0x40, 0x40, 0xFF, 0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0F, 0x00, 0x01, 0xFF, 0x93, 0x00, 0xFF, 0xD9,
         ];
         push_box(b"jp2c", &codestream, &mut output);
         output

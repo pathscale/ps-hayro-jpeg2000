@@ -12,11 +12,11 @@ use super::build::{CodeBlock, Decomposition, Layer, Precinct, Segment, SubBand, 
 use super::codestream::{ComponentInfo, Header, QuantizationStyle, WaveletTransform};
 use super::idwt::IDWTOutput;
 use super::limits::BufferSizes;
-use super::progression::{ProgressionData, progression_iterator};
+use super::progression::{progression_iterator, ProgressionData};
 use super::tag_tree::TagNode;
 use super::tile::Tile;
-use super::{ComponentData, bitplane, build, idwt, mct, segment, tile};
-use crate::error::{DecodingError, Result, TileError, bail};
+use super::{bitplane, build, idwt, mct, segment, tile, ComponentData};
+use crate::error::{bail, DecodingError, Result, TileError};
 use crate::j2c::segment::MAX_BITPLANE_COUNT;
 use crate::math::SimdBuffer;
 use crate::reader::BitReader;
@@ -29,38 +29,29 @@ pub(crate) fn decode<'a>(
     settings: &crate::DecodeSettings,
     palette_components: usize,
 ) -> Result<()> {
-    super::limits::check_image(header, settings)?;
+    let tile_count = header.size_data.num_tiles()?;
+    if tile_count > 65_536 {
+        return Err(crate::error::ValidationError::ImageTooLarge.into());
+    }
+    let samples = super::limits::check_image(header, settings)?;
+    let tile_count = usize::try_from(tile_count)
+        .map_err(|_| crate::error::ValidationError::MemoryLimitExceeded)?;
+    let tile_bytes = super::limits::tile_table_bytes(header, tile_count)?;
+    let planes = super::limits::raw_plane_bytes(header, samples)?;
+    super::limits::check_total_bytes(
+        tile_bytes
+            .checked_add(planes)
+            .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?,
+        settings,
+    )?;
     let mut reader = BitReader::new(data);
-    let tile_count = u64::from(header.size_data.num_tiles()?);
-    let mut per_tile = core::mem::size_of::<Tile<'_>>() as u64;
-    for info in &header.component_infos {
-        let bytes = core::mem::size_of_val(info)
-            .checked_add(core::mem::size_of_val(
-                info.coding_style.parameters.precinct_exponents.as_slice(),
-            ))
-            .and_then(|n| {
-                n.checked_add(core::mem::size_of_val(
-                    info.quantization_info.step_sizes.as_slice(),
-                ))
-            })
-            .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
-        per_tile = per_tile
-            .checked_add(bytes as u64)
-            .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
-    }
-    let tile_bytes = tile_count
-        .checked_mul(per_tile)
-        .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
-    if tile_count > 65_536 || tile_bytes > settings.max_bytes {
-        return Err(crate::error::ValidationError::MemoryLimitExceeded.into());
-    }
     let tiles = tile::parse(&mut reader, header)?;
 
     if tiles.is_empty() {
         bail!(TileError::Invalid);
     }
 
-    let sizes = BufferSizes::new(header, &tiles, settings, palette_components)?;
+    let sizes = BufferSizes::new(header, &tiles, settings, palette_components, tile_bytes)?;
     ctx.reset(header, &sizes);
 
     for tile in &tiles {
@@ -407,7 +398,7 @@ fn decode_sub_band_bitplanes(
 }
 
 fn apply_sign_shift(channel_data: &mut [ComponentData], component_infos: &[ComponentInfo]) {
-    use crate::math::{Level, dispatch, f32x8};
+    use crate::math::{dispatch, f32x8, Level};
 
     for (channel, component_info) in channel_data.iter_mut().zip(component_infos.iter()) {
         if component_info.size_info.is_signed {
@@ -454,8 +445,8 @@ fn store(
         let source_row = (source_y as usize - output.rect.y0 as usize) * source_width;
         let output_row = y as usize * width;
         if sx == cx {
-            let source_x = (u64::from(rect.x0) + ox)
-                .saturating_sub(u64::from(output.rect.x0)) as usize;
+            let source_x =
+                (u64::from(rect.x0) + ox).saturating_sub(u64::from(output.rect.x0)) as usize;
             let count = rect.width() as usize;
             if source_x + count <= source_width {
                 channel_data.container[output_row + rect.x0 as usize..][..count]
@@ -473,4 +464,3 @@ fn store(
         }
     }
 }
-
