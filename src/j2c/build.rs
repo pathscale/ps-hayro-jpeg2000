@@ -1,41 +1,87 @@
 //! Building and setting up decompositions, sub-bands, precincts and code-blocks.
 
 use super::decode::{DecompositionStorage, TileDecompositions};
+use super::limits::check_total_bytes;
 use super::rect::IntRect;
 use super::tag_tree::TagTree;
 use super::tile::{ResolutionTile, Tile};
+use crate::DecodeSettings;
 use crate::error::{DecodingError, Result, ValidationError};
 use alloc::vec;
+use alloc::vec::Vec;
 use core::iter;
 use core::ops::Range;
 
-/// Build and allocate all necessary structures to process the code-blocks
-/// for a specific tile. Also parses the segments for each code-block.
+/// Tracks the estimated bytes for the current tile's construction entries.
+pub(crate) struct BuildBudget<'a> {
+    total_bytes: usize,
+    settings: &'a DecodeSettings,
+}
+
+impl<'a> BuildBudget<'a> {
+    pub(crate) fn new(fixed_bytes: usize, settings: &'a DecodeSettings) -> Self {
+        Self {
+            total_bytes: fixed_bytes,
+            settings,
+        }
+    }
+
+    pub(crate) fn reserve<T>(&mut self, values: &mut Vec<T>, additional: usize) -> Result<()> {
+        let error = ValidationError::MemoryLimitExceeded;
+        let added_bytes = additional.checked_mul(size_of::<T>()).ok_or(error)?;
+        let total = self.total_bytes.checked_add(added_bytes).ok_or(error)?;
+        check_total_bytes(total, self.settings)?;
+        values.try_reserve(additional).map_err(|_| error)?;
+        self.total_bytes = total;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod construction_budget_tests {
+    use super::*;
+
+    #[test]
+    fn reused_capacity_still_obeys_the_tile_budget() {
+        let settings = DecodeSettings { max_bytes: 16, ..DecodeSettings::default() };
+        let mut entries = Vec::<u64>::with_capacity(64);
+        let mut budget = BuildBudget::new(8, &settings);
+        budget.reserve(&mut entries, 1).unwrap();
+        entries.push(7);
+        assert!(budget.reserve(&mut entries, 1).is_err());
+        assert_eq!(entries.as_slice(), &[7]);
+        entries.clear();
+        let mut next_tile = BuildBudget::new(8, &settings);
+        next_tile.reserve(&mut entries, 1).unwrap();
+    }
+
+    #[test]
+    fn overflow_is_rejected_before_vector_growth() {
+        let settings = DecodeSettings { max_bytes: u64::MAX, ..DecodeSettings::default() };
+        let mut entries = Vec::<u64>::new();
+        let mut budget = BuildBudget::new(0, &settings);
+        assert!(budget.reserve(&mut entries, usize::MAX).is_err());
+        assert_eq!(entries.capacity(), 0);
+        budget.reserve(&mut entries, 1).unwrap();
+    }
+}
+
+/// Build the structures needed to process a tile's code-blocks.
 pub(crate) fn build(
     tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
     skipped_resolution_levels: u8,
+    mut budget: BuildBudget<'_>,
 ) -> Result<()> {
-    build_decompositions(tile, storage, skipped_resolution_levels)
-}
-
-fn build_decompositions(
-    tile: &Tile<'_>,
-    storage: &mut DecompositionStorage<'_>,
-    skipped_resolution_levels: u8,
-) -> Result<()> {
-    let mut component_samples = vec![];
-
+    let mut max_coefficients = 0;
     for component_tile in tile.component_tiles() {
         let decoded_resolutions =
             component_tile.component_info.num_resolution_levels() - skipped_resolution_levels;
         let top_resolution = ResolutionTile::new(component_tile, decoded_resolutions - 1);
-        component_samples.push(
-            usize::try_from(top_resolution.rect.area())
-                .map_err(|_| ValidationError::ImageTooLarge)?,
-        );
+        let samples = usize::try_from(top_resolution.rect.area())
+            .map_err(|_| ValidationError::ImageTooLarge)?;
+        max_coefficients = max_coefficients.max(samples);
     }
-    let max_coefficients = component_samples.iter().copied().max().unwrap_or(0);
 
     if storage.coefficients.is_empty() {
         // Fast path that requests pre-zeroed memory from the OS where available.
@@ -44,7 +90,7 @@ fn build_decompositions(
         storage.coefficients.resize(max_coefficients, 0.0);
     }
 
-    for (component_idx, component_tile) in tile.component_tiles().enumerate() {
+    for component_tile in tile.component_tiles() {
         let mut coefficient_counter = 0_usize;
         let decoded_resolutions =
             component_tile.component_info.num_resolution_levels() - skipped_resolution_levels;
@@ -53,12 +99,11 @@ fn build_decompositions(
 
         let mut build_sub_band = |sub_band_type: SubBandType,
                                   resolution_tile: &ResolutionTile<'_>,
-                                  storage: &mut DecompositionStorage<'_>|
+                                  storage: &mut DecompositionStorage<'_>,
+                                  budget: &mut BuildBudget<'_>|
          -> Result<usize> {
             let sub_band_rect = resolution_tile.sub_band_rect(sub_band_type);
-
-
-            let precincts = build_precincts(resolution_tile, sub_band_rect, tile, storage)?;
+            let precincts = build_precincts(resolution_tile, sub_band_rect, storage, budget)?;
 
             // No need to allocate coefficients for skipped resolution levels.
             let added_coefficients = if resolution_tile.resolution < decoded_resolutions {
@@ -73,10 +118,11 @@ fn build_decompositions(
             coefficient_counter = next_coefficient_counter;
 
             let idx = storage.sub_bands.len();
+            budget.reserve(&mut storage.sub_bands, 1)?;
             storage.sub_bands.push(SubBand {
                 sub_band_type,
                 rect: sub_band_rect,
-                precincts: precincts.clone(),
+                precincts,
                 coefficients,
             });
 
@@ -85,30 +131,36 @@ fn build_decompositions(
 
         // Resolution 0 always is the LL sub-band.
         let ll_resolution_tile = resolution_tiles.next().unwrap();
-        let first_ll_sub_band = build_sub_band(SubBandType::LowLow, &ll_resolution_tile, storage)?;
+        let first_ll_sub_band =
+            build_sub_band(SubBandType::LowLow, &ll_resolution_tile, storage, &mut budget)?;
 
         for resolution_tile in resolution_tiles {
             let decomposition = Decomposition {
                 sub_bands: [
-                    build_sub_band(SubBandType::HighLow, &resolution_tile, storage)?,
-                    build_sub_band(SubBandType::LowHigh, &resolution_tile, storage)?,
-                    build_sub_band(SubBandType::HighHigh, &resolution_tile, storage)?,
+                    build_sub_band(SubBandType::HighLow, &resolution_tile, storage, &mut budget)?,
+                    build_sub_band(SubBandType::LowHigh, &resolution_tile, storage, &mut budget)?,
+                    build_sub_band(SubBandType::HighHigh, &resolution_tile, storage, &mut budget)?,
                 ],
                 rect: resolution_tile.rect,
             };
 
+            budget.reserve(&mut storage.decompositions, 1)?;
             storage.decompositions.push(decomposition);
         }
 
         let d_end = storage.decompositions.len();
 
+        budget.reserve(&mut storage.tile_decompositions, 1)?;
         storage.tile_decompositions.push(TileDecompositions {
             decompositions: d_start..d_end,
             first_ll_sub_band,
             coefficient_count: coefficient_counter,
         });
 
-        assert_eq!(coefficient_counter, component_samples[component_idx]);
+        let top_resolution = ResolutionTile::new(component_tile, decoded_resolutions - 1);
+        let samples = usize::try_from(top_resolution.rect.area())
+            .map_err(|_| ValidationError::ImageTooLarge)?;
+        assert_eq!(coefficient_counter, samples);
     }
 
     Ok(())
@@ -117,8 +169,8 @@ fn build_decompositions(
 fn build_precincts(
     resolution_tile: &ResolutionTile<'_>,
     sub_band_rect: IntRect,
-    tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
+    budget: &mut BuildBudget<'_>,
 ) -> Result<Range<usize>> {
     let start = storage.precincts.len();
 
@@ -155,22 +207,30 @@ fn build_precincts(
             code_block_area.height() / cb_height
         };
 
-
         let blocks = build_code_blocks(
             code_block_area,
             sub_band_rect,
             resolution_tile,
             code_blocks_x,
             code_blocks_y,
-            tile,
             storage,
-        );
+            budget,
+        )?;
 
-        let code_inclusion_tree =
-            TagTree::new(code_blocks_x, code_blocks_y, &mut storage.tag_tree_nodes);
-        let zero_bitplane_tree =
-            TagTree::new(code_blocks_x, code_blocks_y, &mut storage.tag_tree_nodes);
+        let code_inclusion_tree = TagTree::new(
+            code_blocks_x,
+            code_blocks_y,
+            &mut storage.tag_tree_nodes,
+            budget,
+        )?;
+        let zero_bitplane_tree = TagTree::new(
+            code_blocks_x,
+            code_blocks_y,
+            &mut storage.tag_tree_nodes,
+            budget,
+        )?;
 
+        budget.reserve(&mut storage.precincts, 1)?;
         storage.precincts.push(Precinct {
             code_blocks: blocks,
             code_inclusion_tree,
@@ -189,9 +249,18 @@ fn build_code_blocks(
     tile_instance: &ResolutionTile<'_>,
     code_blocks_x: u32,
     code_blocks_y: u32,
-    tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
-) -> Range<usize> {
+    budget: &mut BuildBudget<'_>,
+) -> Result<Range<usize>> {
+    let num_layers = usize::from(tile_instance.component_tile.tile.num_layers);
+    let block_count = usize::try_from(u64::from(code_blocks_x) * u64::from(code_blocks_y))
+        .map_err(|_| ValidationError::MemoryLimitExceeded)?;
+    let layer_count = block_count
+        .checked_mul(num_layers)
+        .ok_or(ValidationError::MemoryLimitExceeded)?;
+    budget.reserve(&mut storage.code_blocks, block_count)?;
+    budget.reserve(&mut storage.layers, layer_count)?;
+
     let mut y = code_block_area.y0;
 
     let code_block_width = tile_instance.code_block_width();
@@ -210,7 +279,6 @@ fn build_code_blocks(
             let area = IntRect::from_xywh(x, y, code_block_width, code_block_height)
                 .intersect(sub_band_rect);
 
-
             let start = storage.layers.len();
             storage.layers.extend(iter::repeat_n(
                 Layer {
@@ -218,7 +286,7 @@ fn build_code_blocks(
                     // layer segments.
                     segments: None,
                 },
-                tile.num_layers as usize,
+                num_layers,
             ));
             let end = storage.layers.len();
 
@@ -242,7 +310,7 @@ fn build_code_blocks(
 
     let end = storage.code_blocks.len();
 
-    start..end
+    Ok(start..end)
 }
 
 pub(crate) struct Decomposition {

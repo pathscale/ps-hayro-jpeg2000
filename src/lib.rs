@@ -125,10 +125,12 @@ pub struct DecodeSettings {
     /// Maximum number of decoded image pixels.
     pub max_pixels: u64,
     /// Maximum estimated bytes for retained tile metadata, component planes,
-    /// coefficient storage, IDWT output and scratch, and peak palette-expansion
-    /// planes. The tile metadata estimate counts inherited and overridden
-    /// entries, progression entries, tile parts, and separated packet-header
-    /// readers. Unused collection capacity is excluded.
+    /// coefficient storage, IDWT output and scratch, peak palette-expansion
+    /// planes, and construction entries for the current tile. Construction
+    /// entries include decompositions, sub-bands, precincts, code-blocks,
+    /// layers, and tag-tree nodes. The tile metadata estimate counts inherited
+    /// and overridden entries, progression entries, tile parts, and separated
+    /// packet-header readers. Unused collection capacity is excluded.
     ///
     /// Main-header and JP2 box metadata, parser temporaries, allocator overhead,
     /// compressed input, packet-decode workspace, and caller-owned packed output

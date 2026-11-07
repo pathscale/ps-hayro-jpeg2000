@@ -10,6 +10,7 @@ pub(crate) struct BufferSizes {
     pub(crate) coefficients: usize,
     pub(crate) output: usize,
     pub(crate) scratch: usize,
+    pub(crate) construction_base_bytes: usize,
 }
 
 fn memory_error() -> ValidationError {
@@ -104,6 +105,7 @@ impl BufferSizes {
             coefficients: 0,
             output: 0,
             scratch: 0,
+            construction_base_bytes: 0,
         };
         for tile in tiles {
             for component_tile in tile.component_tiles() {
@@ -154,6 +156,7 @@ impl BufferSizes {
             .and_then(|n| n.checked_add(reconstruction_bytes))
             .ok_or_else(memory_error)?;
         check_total_bytes(total, settings)?;
+        sizes.construction_base_bytes = total;
         Ok(sizes)
     }
 }
