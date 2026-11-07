@@ -31,6 +31,29 @@ pub(crate) fn decode<'a>(
 ) -> Result<()> {
     super::limits::check_image(header, settings)?;
     let mut reader = BitReader::new(data);
+    let tile_count = u64::from(header.size_data.num_tiles()?);
+    let mut per_tile = core::mem::size_of::<Tile<'_>>() as u64;
+    for info in &header.component_infos {
+        let bytes = core::mem::size_of_val(info)
+            .checked_add(core::mem::size_of_val(
+                info.coding_style.parameters.precinct_exponents.as_slice(),
+            ))
+            .and_then(|n| {
+                n.checked_add(core::mem::size_of_val(
+                    info.quantization_info.step_sizes.as_slice(),
+                ))
+            })
+            .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
+        per_tile = per_tile
+            .checked_add(bytes as u64)
+            .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
+    }
+    let tile_bytes = tile_count
+        .checked_mul(per_tile)
+        .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
+    if tile_count > 65_536 || tile_bytes > settings.max_bytes {
+        return Err(crate::error::ValidationError::MemoryLimitExceeded.into());
+    }
     let tiles = tile::parse(&mut reader, header)?;
 
     if tiles.is_empty() {
