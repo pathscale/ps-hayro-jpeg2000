@@ -124,17 +124,16 @@ pub struct DecodeSettings {
     pub target_resolution: Option<(u32, u32)>,
     /// Maximum number of decoded image pixels.
     pub max_pixels: u64,
-    /// Maximum estimated bytes for retained tile metadata, component planes,
-    /// coefficient storage, IDWT output and scratch, peak palette-expansion
-    /// planes, and construction entries for the current tile. Construction
-    /// entries include decompositions, sub-bands, precincts, code-blocks,
-    /// layers, and tag-tree nodes. The tile metadata estimate counts inherited
-    /// and overridden entries, progression entries, tile parts, and separated
-    /// packet-header readers. Unused collection capacity is excluded.
+    /// Maximum estimated heap payload for image parsing and decoding.
     ///
-    /// Main-header and JP2 box metadata, parser temporaries, allocator overhead,
-    /// compressed input, packet-decode workspace, and caller-owned packed output
-    /// are excluded.
+    /// The estimate includes main-header and JP2 metadata, marker parsing
+    /// buffers, tile and packet metadata, progression workspace, component
+    /// planes, palette expansion, reconstruction, and code-block scratch.
+    /// Metadata retained by the image counts toward its later decode budget.
+    ///
+    /// Compressed input borrowed from the caller, packed output requested
+    /// separately, unused collection capacity, and allocator overhead are
+    /// excluded. This is an estimate, not a process memory limit.
     pub max_bytes: u64,
 }
 
@@ -159,6 +158,8 @@ pub struct Image<'a> {
     /// The JP2 boxes of the image. In the case of a raw codestream, we
     /// will synthesize the necessary boxes.
     pub(crate) boxes: ImageBoxes,
+    /// Heap payload retained by the main header and container metadata.
+    pub(crate) metadata_bytes: usize,
     /// Settings that should be applied during decoding.
     pub(crate) settings: DecodeSettings,
     /// Whether the image has an alpha channel.
@@ -233,16 +234,16 @@ impl<'a> Image<'a> {
         } else {
             0
         };
-        j2c::decode(
+        let fixed_bytes = j2c::decode(
             self.codestream,
             &self.header,
             decoder_context,
             settings,
             palette_components,
+            self.metadata_bytes,
         )?;
         let mut decoded_image = DecodedImage {
             decoded_components: &mut decoder_context.channel_data,
-            boxes: self.boxes.clone(),
             has_premultiplied_alpha: self.has_premultiplied_alpha(),
         };
 
@@ -250,19 +251,20 @@ impl<'a> Image<'a> {
         if settings.resolve_palette_indices {
             let components = core::mem::take(decoded_image.decoded_components);
             *decoded_image.decoded_components =
-                resolve_palette_indices(components, &decoded_image.boxes)?;
+                resolve_palette_indices(components, &self.boxes)?;
         }
 
         let apply_postprocessing =
-            settings.resolve_palette_indices || decoded_image.boxes.palette.is_none();
+            settings.resolve_palette_indices || self.boxes.palette.is_none();
         if apply_postprocessing {
-            if let Some(cdef) = &decoded_image.boxes.channel_definition {
-                cdef.reorder(decoded_image.decoded_components)?;
+            if let Some(cdef) = &self.boxes.channel_definition {
+                let budget = j2c::BuildBudget::new(fixed_bytes, settings);
+                cdef.reorder(decoded_image.decoded_components, budget)?;
             }
 
             // Note that this is only valid if all images have the same bit depth.
             let bit_depth = decoded_image.decoded_components[0].bit_depth;
-            convert_color_space(&mut decoded_image, bit_depth)?;
+            convert_color_space(&mut decoded_image, &self.boxes, bit_depth)?;
         }
 
         Ok(decoded_image)
@@ -273,6 +275,7 @@ pub(crate) fn resolve_alpha_and_color_space(
     boxes: &ImageBoxes,
     header: &Header<'_>,
     settings: &DecodeSettings,
+    budget: &mut j2c::BuildBudget<'_>,
 ) -> Result<(ColorSpace, bool)> {
     let actual_num_components = header.component_infos.len();
     let defined_components = if boxes.palette.is_some() {
@@ -286,7 +289,7 @@ pub(crate) fn resolve_alpha_and_color_space(
         actual_num_components
     };
     if let Some(cdef) = &boxes.channel_definition {
-        cdef.permutation(defined_components)?;
+        cdef.permutation(defined_components, *budget)?;
     }
 
     let num_components = if settings.resolve_palette_indices && boxes.palette.is_some() {
@@ -310,8 +313,10 @@ pub(crate) fn resolve_alpha_and_color_space(
     }
 
     let colour_components = num_components - usize::from(has_alpha);
-    let mut color_space = get_color_space(boxes, colour_components)?;
+    let before_color_space = budget.total();
+    let mut color_space = get_color_space(boxes, colour_components, budget)?;
     if color_space.num_channels() as usize != colour_components {
+        budget.release_bytes(budget.total() - before_color_space)?;
         // Opacity is authoritative only when a CDEF marks it.
         color_space = match colour_components {
             1 => ColorSpace::Gray,
@@ -549,9 +554,8 @@ fn component_conversion(component: &ComponentData, maximum: f32) -> (f32, f32) {
     (offset, scale)
 }
 
-fn convert_color_space(image: &mut DecodedImage<'_>, bit_depth: u8) -> Result<()> {
-    if let Some(jp2::colr::ColorSpace::Enumerated(e)) = &image
-        .boxes
+fn convert_color_space(image: &mut DecodedImage<'_>, boxes: &ImageBoxes, bit_depth: u8) -> Result<()> {
+    if let Some(jp2::colr::ColorSpace::Enumerated(e)) = &boxes
         .color_specification
         .as_ref()
         .map(|i| &i.color_space)
@@ -579,7 +583,11 @@ fn convert_color_space(image: &mut DecodedImage<'_>, bit_depth: u8) -> Result<()
     Ok(())
 }
 
-fn get_color_space(boxes: &ImageBoxes, num_components: usize) -> Result<ColorSpace> {
+fn get_color_space(
+    boxes: &ImageBoxes,
+    num_components: usize,
+    budget: &mut j2c::BuildBudget<'_>,
+) -> Result<ColorSpace> {
     let cs = match boxes
         .color_specification
         .as_ref()
@@ -592,20 +600,24 @@ fn get_color_space(boxes: &ImageBoxes, num_components: usize) -> Result<ColorSpa
                 EnumeratedColorspace::Srgb => ColorSpace::RGB,
                 EnumeratedColorspace::RommRgb => {
                     // Use an ICC profile to process the RommRGB color space.
+                    let profile = include_bytes!("../assets/ProPhoto-v2-micro.icc").as_slice();
+                    budget.charge::<u8>(profile.len())?;
                     ColorSpace::Icc {
-                        profile: Arc::from(
-                            include_bytes!("../assets/ProPhoto-v2-micro.icc").as_slice(),
-                        ),
+                        profile: Arc::from(profile),
                         num_channels: 3,
                     }
                 }
                 EnumeratedColorspace::EsRgb => ColorSpace::RGB,
                 EnumeratedColorspace::Greyscale => ColorSpace::Gray,
                 EnumeratedColorspace::Sycc => ColorSpace::RGB,
-                EnumeratedColorspace::CieLab(_) => ColorSpace::Icc {
-                    profile: Arc::from(include_bytes!("../assets/LAB.icc").as_slice()),
-                    num_channels: 3,
-                },
+                EnumeratedColorspace::CieLab(_) => {
+                    let profile = include_bytes!("../assets/LAB.icc").as_slice();
+                    budget.charge::<u8>(profile.len())?;
+                    ColorSpace::Icc {
+                        profile: Arc::from(profile),
+                        num_channels: 3,
+                    }
+                }
                 _ => bail!(FormatError::Unsupported),
             }
         }
@@ -866,7 +878,7 @@ fn sycc_to_rgb<S: Simd>(simd: S, components: &mut [ComponentData], bit_depth: u8
 }
 
 #[cfg(test)]
-mod raw_palette_index_tests {
+mod palette_budget_tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -879,7 +891,7 @@ mod raw_palette_index_tests {
         output.extend_from_slice(payload);
     }
 
-    fn sycc_palette_jp2() -> Vec<u8> {
+    fn palette_jp2(rows: u16, reorder: bool) -> Vec<u8> {
         let mut output = vec![
             0, 0, 0, 12, b'j', b'P', b' ', b' ', 13, 10, 135, 10, 0, 0, 0, 20, b'f', b't', b'y',
             b'p', b'j', b'p', b' ', b' ', 0, 0, 0, 0, b'j', b'p', b' ', b' ',
@@ -892,12 +904,22 @@ mod raw_palette_index_tests {
             &[0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 7, 7, 0, 0],
             &mut header,
         );
-        // Enumerated sYCC (method 1, enumerated colour space 18).
-        push_box(b"colr", &[1, 0, 0, 0, 0, 0, 18], &mut header);
-        // One unsigned 8-bit row with three palette columns.
-        push_box(b"pclr", &[0, 1, 3, 7, 7, 7, 96, 128, 192], &mut header);
+        // Enumerated sYCC, or sRGB when testing an explicit channel order.
+        push_box(b"colr", &[1, 0, 0, 0, 0, 0, if reorder { 16 } else { 18 }], &mut header);
+        let mut palette = Vec::new();
+        palette.extend_from_slice(&rows.to_be_bytes());
+        palette.extend_from_slice(&[3, 7, 7, 7]);
+        for _ in 0..rows {
+            palette.extend_from_slice(&[96, 128, 192]);
+        }
+        push_box(b"pclr", &palette, &mut header);
         // Map component zero to palette columns zero through two.
         push_box(b"cmap", &[0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 2], &mut header);
+        if reorder {
+            // Input channels 0, 1, 2 map to output channels 1, 2, 0.
+            push_box(b"cdef", &[0, 3, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 3,
+                0, 2, 0, 0, 0, 1], &mut header);
+        }
         push_box(b"jp2h", &header, &mut output);
 
         let codestream = [
@@ -922,7 +944,7 @@ mod raw_palette_index_tests {
 
     #[test]
     fn raw_palette_indices_skip_cdef_and_colr_but_mapped_indices_convert() {
-        let data = sycc_palette_jp2();
+        let data = palette_jp2(1, false);
         let raw_settings = DecodeSettings {
             resolve_palette_indices: false,
             ..DecodeSettings::default()
@@ -951,6 +973,55 @@ mod raw_palette_index_tests {
             assert!(actual.abs_diff(expected) <= 1);
         }
     }
+
+    #[test]
+    fn palette_rows_share_the_main_header_cap_and_preserve_channel_order() {
+        let small = palette_jp2(1, true);
+        let large = palette_jp2(16, true);
+        for strict in [false, true] {
+            let settings = DecodeSettings {
+                strict,
+                ..DecodeSettings::default()
+            };
+            let run = |data: &[u8], max_bytes, decode| -> crate::error::Result<()> {
+                let image = Image::new(data, &DecodeSettings { max_bytes, ..settings })?;
+                if decode {
+                    let mut context = DecoderContext::default();
+                    let decoded = image.decode(&mut context)?;
+                    assert_eq!(decoded.data_u8(), [192, 96, 128]);
+                }
+                Ok(())
+            };
+            let minimum_cap = |data: &[u8], decode| {
+                let mut lo = 0;
+                let mut hi = 4096;
+                run(data, hi, decode).unwrap();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    match run(data, mid, decode) {
+                        Ok(()) => hi = mid,
+                        Err(crate::DecodeError::Validation(
+                            crate::ValidationError::MemoryLimitExceeded,
+                        )) => lo = mid + 1,
+                        Err(error) => panic!("unexpected JP2 error: {error:?}"),
+                    }
+                }
+                assert!(matches!(
+                    run(data, lo - 1, decode),
+                    Err(crate::DecodeError::Validation(crate::ValidationError::MemoryLimitExceeded))
+                ));
+                run(data, lo, decode).unwrap();
+                lo
+            };
+            let row_bytes = size_of::<Vec<u64>>() + 3 * size_of::<u64>();
+            let delta = (15 * row_bytes) as u64;
+            let small_parse = minimum_cap(&small, false);
+            let small_decode = minimum_cap(&small, true);
+            assert!(small_decode > small_parse);
+            assert_eq!(minimum_cap(&large, false), small_parse + delta);
+            assert_eq!(minimum_cap(&large, true), small_decode + delta);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -972,10 +1043,16 @@ mod unsigned_mixed_precision_lab {
         }
     }
 
-    fn fixture<'a>(components: &'a mut Vec<ComponentData>, lab: CieLab) -> DecodedImage<'a> {
-        DecodedImage {
-            decoded_components: components,
-            boxes: ImageBoxes {
+    fn fixture<'a>(
+        components: &'a mut Vec<ComponentData>,
+        lab: CieLab,
+    ) -> (DecodedImage<'a>, ImageBoxes) {
+        (
+            DecodedImage {
+                decoded_components: components,
+                has_premultiplied_alpha: false,
+            },
+            ImageBoxes {
                 color_specification: Some(ColorSpecificationBox {
                     color_space: BoxColorSpace::Enumerated(
                         super::jp2::colr::EnumeratedColorspace::CieLab(lab),
@@ -983,8 +1060,7 @@ mod unsigned_mixed_precision_lab {
                 }),
                 ..ImageBoxes::default()
             },
-            has_premultiplied_alpha: false,
-        }
+        )
     }
 
     fn assert_within_u8(actual: &[u8], expected: &[u8]) {
@@ -1023,19 +1099,21 @@ mod unsigned_mixed_precision_lab {
             component(&[values[1]], precisions[1], false),
             component(&[values[2]], precisions[2], false),
         ];
-        let mut decoded = fixture(&mut components, lab);
+        let (mut decoded, boxes) = fixture(&mut components, lab);
         let original_metadata = decoded
             .components()
             .iter()
             .map(|component| (component.bit_depth(), component.is_signed()))
             .collect::<Vec<_>>();
-        let before = get_color_space(&decoded.boxes, 3).unwrap();
+        let settings = super::DecodeSettings::default();
+        let mut budget = super::j2c::BuildBudget::new(0, &settings);
+        let before = get_color_space(&boxes, 3, &mut budget).unwrap();
         assert!(matches!(before, ColorSpace::Icc { profile, num_channels: 3 }
             if profile.as_ref() == include_bytes!("../assets/LAB.icc").as_slice()));
 
-        super::convert_color_space(&mut decoded, bit_depth).unwrap();
+        super::convert_color_space(&mut decoded, &boxes, bit_depth).unwrap();
 
-        let after = get_color_space(&decoded.boxes, 3).unwrap();
+        let after = get_color_space(&boxes, 3, &mut budget).unwrap();
         assert!(matches!(after, ColorSpace::Icc { profile, num_channels: 3 }
             if profile.as_ref() == include_bytes!("../assets/LAB.icc").as_slice()));
         assert_eq!(
@@ -1101,8 +1179,8 @@ mod unsigned_mixed_precision_lab {
             component(&[3.0, 22.0], 5, false),
         ];
         let original_alpha = components[3].samples().to_vec();
-        let mut decoded = fixture(&mut components, default_lab());
-        super::convert_color_space(&mut decoded, 8).unwrap();
+        let (mut decoded, boxes) = fixture(&mut components, default_lab());
+        super::convert_color_space(&mut decoded, &boxes, 8).unwrap();
         assert_eq!(decoded.components()[3].samples().to_vec(), original_alpha);
         assert_eq!(decoded.components()[3].bit_depth(), 5);
         assert!(!decoded.components()[3].is_signed());
@@ -1130,8 +1208,8 @@ mod unsigned_mixed_precision_lab {
             component(&[values[1]], precisions[1], false),
             component(&[values[2]], precisions[2], true),
         ];
-        let mut decoded = fixture(&mut components, default_lab());
-        super::convert_color_space(&mut decoded, bit_depth).unwrap();
+        let (mut decoded, boxes) = fixture(&mut components, default_lab());
+        super::convert_color_space(&mut decoded, &boxes, bit_depth).unwrap();
         for (index, expected) in scalar_expected.into_iter().enumerate() {
             assert!((decoded.components()[index].samples()[0] - expected).abs() < 0.001);
         }

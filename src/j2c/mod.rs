@@ -20,6 +20,7 @@ use crate::{ColorSpace, DecodeSettings, Image};
 
 use crate::math::{SimdBuffer, SIMD_WIDTH};
 pub(crate) use codestream::Header;
+pub(crate) use build::BuildBudget;
 pub(crate) use decode::decode;
 pub use decode::DecoderContext;
 
@@ -54,7 +55,8 @@ impl ComponentData {
 }
 
 pub(crate) fn parse<'a>(stream: &'a [u8], settings: &DecodeSettings) -> Result<Image<'a>> {
-    let parsed_codestream = parse_raw(stream, settings)?;
+    let mut budget = BuildBudget::new(0, settings);
+    let parsed_codestream = parse_raw(stream, settings, &mut budget)?;
     let header = &parsed_codestream.header;
     let boxes = ImageBoxes::default();
     let num_channels = u8::try_from(header.component_infos.len())
@@ -72,6 +74,7 @@ pub(crate) fn parse<'a>(stream: &'a [u8], settings: &DecodeSettings) -> Result<I
         codestream: parsed_codestream.data,
         header: parsed_codestream.header,
         boxes,
+        metadata_bytes: budget.total(),
         settings: *settings,
         color_space,
         has_alpha,
@@ -81,6 +84,7 @@ pub(crate) fn parse<'a>(stream: &'a [u8], settings: &DecodeSettings) -> Result<I
 pub(crate) fn parse_raw<'a>(
     stream: &'a [u8],
     settings: &DecodeSettings,
+    budget: &mut BuildBudget<'_>,
 ) -> Result<ParsedCodestream<'a>> {
     let mut reader = BitReader::new(stream);
 
@@ -89,7 +93,7 @@ pub(crate) fn parse_raw<'a>(
         bail!(MarkerError::Expected("SOC"));
     }
 
-    let header = codestream::read_header(&mut reader, settings)?;
+    let header = codestream::read_header(&mut reader, settings, budget)?;
     let code_stream_data = reader.tail().ok_or(FormatError::MissingCodestream)?;
 
     Ok(ParsedCodestream {
@@ -124,12 +128,16 @@ mod recovery_budget_tests {
     #[test]
     fn tile_grid_error_precedes_pixel_budget_and_byte_gate_precedes_sot_parse() {
         for strict in [false, true] {
+            let bytes = unit_fixture(1, &[0xFF, 0x90]);
+            let probe = Image::new(&bytes, &DecodeSettings::default()).unwrap();
+            let fixed = probe.metadata_bytes
+                + super::limits::raw_plane_bytes(&probe.header, 1).unwrap()
+                + super::limits::tile_table_bytes(&probe.header, 1).unwrap();
             let settings = DecodeSettings {
                 strict,
-                max_bytes: 0,
+                max_bytes: (fixed - 1) as u64,
                 ..DecodeSettings::default()
             };
-            let bytes = unit_fixture(1, &[0xFF, 0x90]);
             let image = Image::new(&bytes, &settings).unwrap();
             let mut context = DecoderContext::default();
             assert!(matches!(
@@ -185,7 +193,7 @@ mod recovery_budget_tests {
             let tiles = super::limits::tile_table_bytes(&probe.header, 1).unwrap();
             assert!(planes > 0 && tiles > 0);
 
-            let cap = planes.max(tiles) as u64;
+            let cap = (probe.metadata_bytes + planes.max(tiles)) as u64;
             let settings = DecodeSettings {
                 strict,
                 max_bytes: cap,
@@ -215,7 +223,7 @@ mod recovery_budget_tests {
             ));
             assert_eq!(context.channel_data[0].samples(), &[128.0_f32]);
 
-            let cap = (planes + tiles) as u64;
+            let cap = (probe.metadata_bytes + planes + tiles) as u64;
             let settings = DecodeSettings {
                 strict,
                 max_bytes: cap,
@@ -228,12 +236,13 @@ mod recovery_budget_tests {
                     crate::MarkerError::ParseFailure("SOT")
                 ))
             ));
+            assert!(context.channel_data.is_empty());
 
             let valid_probe = Image::new(&seed_bytes, &seed_settings).unwrap();
             let valid_samples =
                 super::limits::check_image(&valid_probe.header, &seed_settings).unwrap();
             let valid_tiles = super::limits::tile_table_bytes(&valid_probe.header, 1).unwrap();
-            let exact = valid_tiles
+            let exact = valid_probe.metadata_bytes + valid_tiles
                 + super::limits::raw_plane_bytes(&valid_probe.header, valid_samples).unwrap()
                 + size_of::<super::tile::TilePart<'_>>()
                 + 2 * size_of::<f32>();
@@ -244,13 +253,21 @@ mod recovery_budget_tests {
                 ..DecodeSettings::default()
             };
             let post_parse_image = Image::new(&seed_bytes, &post_parse_settings).unwrap();
+            assert_eq!(
+                seed_image.decode(&mut context).unwrap().components()[0].samples(),
+                &[128.0_f32]
+            );
             assert!(matches!(
                 post_parse_image.decode(&mut context),
                 Err(crate::DecodeError::Validation(
                     ValidationError::MemoryLimitExceeded
                 ))
             ));
-            assert_eq!(context.channel_data[0].samples(), &[128.0_f32]);
+            assert!(context.channel_data.is_empty());
+            assert_eq!(
+                seed_image.decode(&mut context).unwrap().components()[0].samples(),
+                &[128.0_f32]
+            );
         }
     }
 
@@ -263,6 +280,199 @@ mod recovery_budget_tests {
             + size_of::<CodeBlock>()
             + size_of::<Layer>()
             + 2 * size_of::<TagNode>()
+    }
+
+    // A 1×1 block has nine padded coefficient slots (magnitude, state,
+    // neighbor flags) and nine stripe flags, including the border.
+    const ONE_SAMPLE_CODE_BLOCK_BYTES: usize = 9 * (4 + 1 + 1) + 9 * 4;
+
+    fn valid_tile_part(markers: &[u8], packets: &[u8]) -> Vec<u8> {
+        let mut body = alloc::vec![0xFF, 0x90, 0, 10, 0, 0];
+        body.extend_from_slice(&u32::try_from(14 + markers.len() + packets.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&[0, 1]);
+        body.extend_from_slice(markers);
+        body.extend_from_slice(&[0xFF, 0x93]);
+        body.extend_from_slice(packets);
+        body.extend_from_slice(&[0xFF, 0xD9]);
+        body
+    }
+
+    fn decode_at_cap(bytes: &[u8], strict: bool, max_bytes: u64) -> crate::error::Result<Vec<f32>> {
+        let settings = DecodeSettings { strict, max_bytes, ..DecodeSettings::default() };
+        let image = Image::new(bytes, &settings)?;
+        let mut ctx = DecoderContext::default();
+        let decoded = image.decode(&mut ctx)?;
+        Ok(decoded.components()[0].samples().to_vec())
+    }
+
+    fn minimum_decode_cap(bytes: &[u8], strict: bool) -> (u64, Vec<f32>) {
+        let mut lo = 0;
+        let mut hi = 1 << 20;
+        let expected = decode_at_cap(bytes, strict, hi).unwrap();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match decode_at_cap(bytes, strict, mid) {
+                Ok(samples) => {
+                    assert_eq!(samples, expected);
+                    hi = mid;
+                }
+                Err(crate::DecodeError::Validation(ValidationError::MemoryLimitExceeded)) => {
+                    lo = mid + 1;
+                }
+                Err(error) => panic!("unexpected error under a {mid}-byte cap: {error:?}"),
+            }
+        }
+        assert!(matches!(
+            decode_at_cap(bytes, strict, lo - 1),
+            Err(crate::DecodeError::Validation(ValidationError::MemoryLimitExceeded))
+        ));
+        assert_eq!(decode_at_cap(bytes, strict, lo).unwrap(), expected);
+        (lo, expected)
+    }
+
+    #[test]
+    fn precinct_and_code_block_bounds_handle_maximum_reference_coordinates() {
+        let body = valid_tile_part(&[], &[0xE1, 0]);
+        let origin = unit_fixture(1, &body);
+        let mut edge = origin.clone();
+        for field in [8, 12] {
+            edge[field..field + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        }
+        for field in [16, 20, 32, 36] {
+            edge[field..field + 4].copy_from_slice(&(u32::MAX - 1).to_be_bytes());
+        }
+        for strict in [false, true] {
+            let (_, expected) = minimum_decode_cap(&origin, strict);
+            for order in [0, 2, 3, 4] {
+                edge[50] = order;
+                let (_, actual) = minimum_decode_cap(&edge, strict);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn multilayer_segment_copy_is_charged_in_both_modes() {
+        let fixture = |second_header: u8, second_payload: &[u8]| {
+            // First and second layers each contribute one coding pass to the
+            // same block. The second packet omits the zero-bitplane tag.
+            let mut packets = alloc::vec![0xE1, 0, second_header];
+            packets.extend_from_slice(second_payload);
+            let mut bytes = unit_fixture(1, &valid_tile_part(&[], &packets));
+            bytes[52] = 2;
+            bytes
+        };
+        let short = fixture(0xC2, &[0]);
+        let long = fixture(0xC4, &[0, 0]);
+        for strict in [false, true] {
+            let (short_cap, _) = minimum_decode_cap(&short, strict);
+            let (long_cap, _) = minimum_decode_cap(&long, strict);
+            assert_eq!(long_cap, short_cap + 1);
+        }
+    }
+
+    #[test]
+    fn separated_packet_headers_preserve_samples_and_charge_retained_metadata() {
+        let merged = unit_fixture(1, &valid_tile_part(&[], &[0xE1, 0]));
+        let ppt = unit_fixture(1, &valid_tile_part(&[0xFF, 0x61, 0, 4, 0, 0xE1], &[0]));
+        let mut ppm = unit_fixture(1, &[]);
+        ppm.extend_from_slice(&[0xFF, 0x60, 0, 8, 0, 0, 0, 0, 1, 0xE1]);
+        ppm.extend_from_slice(&valid_tile_part(&[], &[0]));
+
+        for strict in [false, true] {
+            let (merged_cap, expected) = minimum_decode_cap(&merged, strict);
+            let (ppt_cap, ppt_samples) = minimum_decode_cap(&ppt, strict);
+            let (ppm_cap, ppm_samples) = minimum_decode_cap(&ppm, strict);
+            assert_eq!(ppt_samples, expected);
+            assert_eq!(ppm_samples, expected);
+            assert_eq!(ppt_cap, merged_cap + size_of::<super::BitReader<'_>>() as u64);
+            assert_eq!(ppm_cap, ppt_cap + size_of::<super::codestream::PpmPacket<'_>>() as u64);
+        }
+    }
+
+    #[test]
+    fn position_progressions_share_the_cap_and_poc_does_not_repeat_packets() {
+        const WIDTH: usize = 32;
+        let fixture = |order: u8, changes: &[u8]| {
+            // Use 1×1 precincts in a single 32×1 tile with two layers.
+            let mut packets = alloc::vec![0xE1, 0];
+            packets.resize(WIDTH + 1, 0);
+            packets.extend_from_slice(&[0xC2, 0]);
+            packets.resize(WIDTH * 2 + 2, 0);
+            let mut bytes = unit_fixture(WIDTH as u32, &valid_tile_part(changes, &packets));
+            bytes[27] = WIDTH as u8;
+            bytes[48] = 13;
+            bytes[49] = 1;
+            bytes[50] = order;
+            bytes[52] = 2;
+            bytes.insert(59, 0);
+            bytes
+        };
+        let sequential = fixture(0, &[]);
+        for strict in [false, true] {
+            let (baseline, expected) = minimum_decode_cap(&sequential, strict);
+            for order in [2, 3, 4] {
+                // Each second progression revisits layer zero before yielding
+                // layer one. The same packets must decode as LRCP.
+                let poc = [0xFF, 0x5F, 0, 16, 0, 0, 0, 1, 1, 1, order,
+                    0, 0, 0, 2, 1, 1, order];
+                let (cap, actual) = minimum_decode_cap(&fixture(order, &poc), strict);
+                assert_eq!(actual, expected);
+                // Both lists coexist while reading packets and each entry
+                // stores at least its u64 precinct index.
+                assert!(cap >= baseline + (2 * WIDTH * size_of::<u64>()) as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn segment_budget_covers_nonempty_packet_in_both_modes() {
+        // One included code-block, one coding pass and a one-byte segment.
+        // The packet header is 1|1|1|0|0|001.
+        let body = [
+            0xFF, 0x90, 0, 10, 0, 0, 0, 0, 0, 16, 0, 1, 0xFF, 0x93, 0xE1, 0, 0xFF, 0xD9,
+        ];
+        let bytes = unit_fixture(1, &body);
+        for strict in [false, true] {
+            let settings = DecodeSettings {
+                strict,
+                max_bytes: u64::MAX,
+                ..DecodeSettings::default()
+            };
+            let probe = Image::new(&bytes, &settings).unwrap();
+            let mut context = DecoderContext::default();
+            let expected = probe.decode(&mut context).unwrap().components()[0].samples()[0];
+            let tiles = super::limits::tile_table_bytes(&probe.header, 1).unwrap();
+            let planes = super::limits::raw_plane_bytes(&probe.header, 1).unwrap();
+            let exact = probe.metadata_bytes + tiles
+                + planes
+                + size_of::<super::tile::TilePart<'_>>()
+                + 2 * size_of::<f32>()
+                + single_block_sub_band_bytes()
+                + size_of::<super::decode::TileDecompositions>()
+                + size_of::<super::build::Segment<'_>>()
+                + ONE_SAMPLE_CODE_BLOCK_BYTES;
+
+            let below_cap = DecodeSettings {
+                max_bytes: u64::try_from(exact - 1).unwrap(),
+                ..settings
+            };
+            let image = Image::new(&bytes, &below_cap).unwrap();
+            assert!(matches!(
+                image.decode(&mut context),
+                Err(crate::DecodeError::Validation(
+                    ValidationError::MemoryLimitExceeded
+                ))
+            ));
+
+            let exact_cap = DecodeSettings {
+                max_bytes: u64::try_from(exact).unwrap(),
+                ..settings
+            };
+            let image = Image::new(&bytes, &exact_cap).unwrap();
+            let decoded = image.decode(&mut context).unwrap();
+            assert_eq!(decoded.components()[0].samples(), &[expected]);
+        }
     }
 
     #[test]
@@ -282,12 +492,13 @@ mod recovery_budget_tests {
             let tile_count = usize::try_from(probe.header.size_data.num_tiles().unwrap()).unwrap();
             let planes = super::limits::raw_plane_bytes(&probe.header, samples).unwrap();
             let tiles = super::limits::tile_table_bytes(&probe.header, tile_count).unwrap();
-            let exact = tiles
+            let exact = probe.metadata_bytes + tiles
                 + planes
                 + size_of::<super::tile::TilePart<'_>>()
                 + 2 * size_of::<f32>()
                 + single_block_sub_band_bytes()
-                + size_of::<super::decode::TileDecompositions>();
+                + size_of::<super::decode::TileDecompositions>()
+                + ONE_SAMPLE_CODE_BLOCK_BYTES;
 
             let below_cap = DecodeSettings {
                 max_bytes: u64::try_from(exact - 1).unwrap(),
@@ -369,10 +580,10 @@ mod recovery_budget_tests {
             };
             let probe = Image::new(&both, &settings).unwrap();
             let inherited = super::limits::tile_table_bytes(&probe.header, 2).unwrap();
-            let planes = super::limits::raw_plane_bytes(&probe.header, 8).unwrap();
+            let fixed = probe.metadata_bytes + super::limits::raw_plane_bytes(&probe.header, 8).unwrap();
             let baseline = inherited + 2 * size_of::<super::tile::TilePart<'_>>();
             let growth = 3 * size_of::<super::codestream::StepSize>();
-            let exact = planes + baseline + 2 * growth;
+            let exact = fixed + baseline + 2 * growth;
             let parse = |bytes: &[u8], cap: usize| {
                 let settings = DecodeSettings {
                     max_bytes: u64::try_from(cap).unwrap(),
@@ -380,7 +591,7 @@ mod recovery_budget_tests {
                 };
                 let image = Image::new(bytes, &settings).unwrap();
                 let mut reader = super::BitReader::new(image.codestream);
-                super::tile::parse(&mut reader, &image.header, inherited, planes, &settings)
+                super::tile::parse(&mut reader, &image.header, fixed, &settings)
                     .map(|(_, retained)| retained)
             };
 
@@ -401,7 +612,8 @@ mod recovery_budget_tests {
                 + (4 + 9) * size_of::<f32>()
                 + 4 * single_block_sub_band_bytes()
                 + size_of::<super::build::Decomposition>()
-                + size_of::<super::decode::TileDecompositions>();
+                + size_of::<super::decode::TileDecompositions>()
+                + ONE_SAMPLE_CODE_BLOCK_BYTES;
             for cap in [decode_cap - 1, decode_cap] {
                 let settings = DecodeSettings {
                     max_bytes: u64::try_from(cap).unwrap(),
@@ -440,13 +652,21 @@ mod recovery_budget_tests {
             };
             let image = Image::new(&bytes, &settings).unwrap();
             let inherited = super::limits::tile_table_bytes(&image.header, 1).unwrap();
-            let planes = super::limits::raw_plane_bytes(&image.header, 1).unwrap();
-            let settings = DecodeSettings {
-                max_bytes: u64::try_from(inherited + planes).unwrap(),
-                ..settings
+            let fixed = image.metadata_bytes + super::limits::raw_plane_bytes(&image.header, 1).unwrap();
+            let exact = fixed + inherited + size_of::<super::tile::PptMarkerData<'_>>();
+            let parse = |cap: usize| {
+                let settings = DecodeSettings {
+                    max_bytes: u64::try_from(cap).unwrap(),
+                    ..settings
+                };
+                let mut reader = super::BitReader::new(image.codestream);
+                super::tile::parse(&mut reader, &image.header, fixed, &settings)
             };
-            let mut reader = super::BitReader::new(image.codestream);
-            let result = super::tile::parse(&mut reader, &image.header, inherited, planes, &settings);
+            assert!(matches!(
+                parse(exact - 1),
+                Err(crate::DecodeError::Validation(ValidationError::MemoryLimitExceeded))
+            ));
+            let result = parse(exact);
             if strict {
                 assert!(matches!(
                     result,

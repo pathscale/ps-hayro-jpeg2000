@@ -3,11 +3,10 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::build::{PrecinctData, SubBandType};
+use super::build::{BuildBudget, PrecinctData, SubBandType};
 use super::codestream::{
     ComponentInfo, Header, ProgressionChange, ProgressionOrder, markers, skip_marker_segment,
 };
-use super::limits::check_total_bytes;
 use super::rect::IntRect;
 use crate::DecodeSettings;
 use crate::error::{MarkerError, Result, TileError, ValidationError, bail, err};
@@ -83,7 +82,7 @@ impl<'a> TilePart<'a> {
 }
 
 impl<'a> Tile<'a> {
-    fn new(idx: u32, header: &Header<'_>) -> Self {
+    fn new(idx: u32, header: &Header<'_>, budget: &mut BuildBudget<'_>) -> Result<Self> {
         let rect = {
             let size_data = &header.size_data;
 
@@ -115,7 +114,17 @@ impl<'a> Tile<'a> {
             IntRect::from_ltrb(x0, y0, x1, y1)
         };
 
-        Tile {
+        let mut component_infos = Vec::new();
+        budget.reserve_exact(&mut component_infos, header.component_infos.len())?;
+        for info in &header.component_infos {
+            component_infos.push(ComponentInfo {
+                size_info: info.size_info,
+                coding_style: info.coding_style.copy_with_budget(budget)?,
+                quantization_info: info.quantization_info.copy_with_budget(budget)?,
+                roi_shift: info.roi_shift,
+            });
+        }
+        Ok(Tile {
             idx,
             // Will be filled once we start parsing.
             tile_parts: vec![],
@@ -123,12 +132,12 @@ impl<'a> Tile<'a> {
             // By default, each tile inherits the settings from the main
             // header. When parsing the tile parts, some of these settings
             // might be overridden.
-            component_infos: header.component_infos.clone(),
+            component_infos,
             progression_order: header.global_coding_style.progression_order,
             progression_changes: vec![],
             mct: header.global_coding_style.mct,
             num_layers: header.global_coding_style.num_layers,
-        }
+        })
     }
 
     /// The tile's exclusive rectangle in the decoded image planes.
@@ -158,37 +167,11 @@ impl<'a> Tile<'a> {
     }
 }
 
-struct TileMetadataBudget<'s> {
-    retained: usize,
-    planes: usize,
-    settings: &'s DecodeSettings,
-}
-
-impl TileMetadataBudget<'_> {
-    fn replace<T>(&mut self, old: usize, new: usize) -> Result<()> {
-        let error = ValidationError::MemoryLimitExceeded;
-        let old = old.checked_mul(size_of::<T>()).ok_or(error)?;
-        let new = new.checked_mul(size_of::<T>()).ok_or(error)?;
-        let retained = self
-            .retained
-            .checked_sub(old)
-            .and_then(|bytes| bytes.checked_add(new))
-            .ok_or(error)?;
-        check_total_bytes(
-            retained.checked_add(self.planes).ok_or(error)?,
-            self.settings,
-        )?;
-        self.retained = retained;
-        Ok(())
-    }
-}
-
 /// Create the tiles and parse their constituent tile parts.
 pub(crate) fn parse<'a>(
     reader: &mut BitReader<'a>,
     main_header: &'a Header<'a>,
-    tile_bytes: usize,
-    planes: usize,
+    fixed_bytes: usize,
     settings: &DecodeSettings,
 ) -> Result<(Vec<Tile<'a>>, usize)> {
     let tile_count = main_header.size_data.num_tiles()?;
@@ -196,15 +179,13 @@ pub(crate) fn parse<'a>(
     if tile_count > 65_536 {
         return Err(ValidationError::ImageTooLarge.into());
     }
-    let mut tiles = (0..tile_count)
-        .map(|idx| Tile::new(idx, main_header))
-        .collect::<Vec<_>>();
-
-    let mut budget = TileMetadataBudget {
-        retained: tile_bytes,
-        planes,
-        settings,
-    };
+    let mut budget = BuildBudget::new(fixed_bytes, settings);
+    let mut tiles = Vec::new();
+    let count = usize::try_from(tile_count).map_err(|_| ValidationError::MemoryLimitExceeded)?;
+    budget.reserve_exact(&mut tiles, count)?;
+    for idx in 0..tile_count {
+        tiles.push(Tile::new(idx, main_header, &mut budget)?);
+    }
     let mut tile_part_idx = 0;
 
     loop {
@@ -219,7 +200,7 @@ pub(crate) fn parse<'a>(
         bail!(MarkerError::Expected("EOC"));
     }
 
-    Ok((tiles, budget.retained))
+    Ok((tiles, budget.total() - fixed_bytes))
 }
 
 fn parse_tile_part<'a>(
@@ -227,7 +208,7 @@ fn parse_tile_part<'a>(
     main_header: &'a Header<'a>,
     tiles: &mut [Tile<'a>],
     tile_part_idx: usize,
-    budget: &mut TileMetadataBudget<'_>,
+    budget: &mut BuildBudget<'_>,
 ) -> Result<()> {
     if reader.read_marker()? != markers::SOT {
         bail!(MarkerError::Expected("SOT"));
@@ -258,6 +239,7 @@ fn parse_tile_part<'a>(
 
     loop {
         let Some(marker) = reader.peek_marker() else {
+            budget.release_bytes(BuildBudget::bytes::<PptMarkerData<'_>>(ppt_headers.len())?)?;
             return if main_header.strict {
                 err!(MarkerError::Invalid)
             } else {
@@ -274,65 +256,62 @@ fn parse_tile_part<'a>(
             // tile-part header, if they appear at all.
             markers::COD => {
                 reader.read_marker()?;
-                let cod = codestream::cod_marker(reader).ok_or(MarkerError::ParseFailure("COD"))?;
+                let cod = codestream::cod_marker(reader, budget)?;
 
                 tile.mct = cod.mct;
                 tile.num_layers = cod.num_layers;
                 tile.progression_order = cod.progression_order;
 
                 for component in &mut tile.component_infos {
-                    budget.replace::<(u8, u8)>(
-                        component.coding_style.parameters.precinct_exponents.len(),
-                        cod.component_parameters.parameters.precinct_exponents.len(),
-                    )?;
+                    let old = core::mem::take(&mut component.coding_style.parameters.precinct_exponents);
+                    let old_bytes = BuildBudget::bytes::<(u8, u8)>(old.len())?;
+                    drop(old);
+                    budget.release_bytes(old_bytes)?;
                     component.coding_style.flags.raw |= cod.component_parameters.flags.raw;
-                    component.coding_style.parameters = cod.component_parameters.clone().parameters;
+                    component.coding_style.parameters =
+                        cod.component_parameters.parameters.copy_with_budget(budget)?;
                 }
+                budget.release_bytes(cod.component_parameters.heap_bytes()?)?;
             }
             markers::COC => {
                 reader.read_marker()?;
 
-                let (component_index, coc) = codestream::coc_marker(reader, num_components as u16)
-                    .ok_or(MarkerError::ParseFailure("COC"))?;
+                let (component_index, coc) =
+                    codestream::coc_marker(reader, num_components as u16, budget)?;
 
                 let old = tile
                     .component_infos
                     .get_mut(component_index as usize)
                     .ok_or(ValidationError::InvalidComponentMetadata)?;
 
-                budget.replace::<(u8, u8)>(
-                    old.coding_style.parameters.precinct_exponents.len(),
-                    coc.parameters.precinct_exponents.len(),
-                )?;
+                budget.release_bytes(old.coding_style.heap_bytes()?)?;
                 old.coding_style.parameters = coc.parameters;
                 old.coding_style.flags.raw |= coc.flags.raw;
             }
             markers::QCD => {
                 reader.read_marker()?;
-                let qcd = codestream::qcd_marker(reader).ok_or(MarkerError::ParseFailure("QCD"))?;
+                let qcd = codestream::qcd_marker(reader, budget)?;
 
                 for component_info in &mut tile.component_infos {
-                    budget.replace::<codestream::StepSize>(
-                        component_info.quantization_info.step_sizes.len(),
-                        qcd.step_sizes.len(),
-                    )?;
-                    component_info.quantization_info = qcd.clone();
+                    let old = core::mem::take(&mut component_info.quantization_info.step_sizes);
+                    let old_bytes = BuildBudget::bytes::<codestream::StepSize>(old.len())?;
+                    drop(old);
+                    budget.release_bytes(old_bytes)?;
+                    component_info.quantization_info = qcd.copy_with_budget(budget)?;
                 }
+                budget.release_bytes(qcd.heap_bytes()?)?;
             }
             markers::QCC => {
                 reader.read_marker()?;
-                let (component_index, qcc) = codestream::qcc_marker(reader, num_components as u16)
-                    .ok_or(MarkerError::ParseFailure("QCC"))?;
+                let (component_index, qcc) =
+                    codestream::qcc_marker(reader, num_components as u16, budget)?;
 
                 let component = tile
                     .component_infos
                     .get_mut(component_index as usize)
                     .ok_or(ValidationError::InvalidComponentMetadata)?;
-                budget.replace::<codestream::StepSize>(
-                    component.quantization_info.step_sizes.len(),
-                    qcc.step_sizes.len(),
-                )?;
-                component.quantization_info = qcc.clone();
+                budget.release_bytes(component.quantization_info.heap_bytes()?)?;
+                component.quantization_info = qcc;
             }
             markers::EOC => break,
             markers::PPT => {
@@ -343,9 +322,7 @@ fn parse_tile_part<'a>(
                 reader.read_marker()?;
                 let ppt = ppt_marker(reader).ok_or(MarkerError::ParseFailure("PPT"))?;
                 // The markers are temporary until the tile part is accepted.
-                ppt_headers
-                    .try_reserve(1)
-                    .map_err(|_| ValidationError::MemoryLimitExceeded)?;
+                budget.reserve(&mut ppt_headers, 1)?;
                 ppt_headers.push(ppt);
             }
             markers::RGN => {
@@ -361,13 +338,9 @@ fn parse_tile_part<'a>(
             }
             markers::POC => {
                 reader.read_marker()?;
-                let changes = codestream::poc_marker(reader, num_components as u16)
-                    .ok_or(MarkerError::ParseFailure("POC"))?;
-                budget.replace::<ProgressionChange>(0, changes.len())?;
-                tile.progression_changes
-                    .try_reserve(changes.len())
-                    .map_err(|_| ValidationError::MemoryLimitExceeded)?;
-                tile.progression_changes.extend(changes);
+                codestream::poc_marker(
+                    reader, num_components as u16, &mut tile.progression_changes, budget,
+                )?;
             }
             markers::PLT => {
                 // Can be inferred ourselves.
@@ -394,6 +367,7 @@ fn parse_tile_part<'a>(
     let remaining_bytes = if let Some(len) = data_len.checked_sub(reader.offset() - start) {
         len
     } else {
+        budget.release_bytes(BuildBudget::bytes::<PptMarkerData<'_>>(ppt_headers.len())?)?;
         return if main_header.strict {
             err!(TileError::Invalid)
         } else {
@@ -410,18 +384,14 @@ fn parse_tile_part<'a>(
         .len()
         .checked_add(ppm.is_some() as usize)
         .ok_or(ValidationError::MemoryLimitExceeded)?;
-    budget.replace::<BitReader<'a>>(0, header_count)?;
-    budget.replace::<TilePart<'a>>(0, 1)?;
-    tile.tile_parts
-        .try_reserve(1)
-        .map_err(|_| ValidationError::MemoryLimitExceeded)?;
-
-    ppt_headers.sort_by(|p1, p2| p1.sequence_idx.cmp(&p2.sequence_idx));
+    budget.reserve(&mut tile.tile_parts, 1)?;
+    let ppt_bytes = BuildBudget::bytes::<PptMarkerData<'_>>(ppt_headers.len())?;
+    // Equal sequence indices keep their codestream order.
+    ppt_headers.sort_unstable_by_key(|ppt| (ppt.sequence_idx, ppt.data.as_ptr()));
     let mut headers = Vec::new();
-    headers
-        .try_reserve_exact(header_count)
-        .map_err(|_| ValidationError::MemoryLimitExceeded)?;
+    budget.reserve_exact(&mut headers, header_count)?;
     headers.extend(ppt_headers.into_iter().map(|ppt| BitReader::new(ppt.data)));
+    budget.release_bytes(ppt_bytes)?;
     if let Some(ppm) = ppm {
         headers.push(BitReader::new(ppm.data));
     }
@@ -723,24 +693,26 @@ impl<'a> ResolutionTile<'a> {
         // precinct in each row/column is at the start position of the tile
         // which might not be a multiple of precinct exponent, but all subsequent
         // precincts are at a multiple of the exponent.
-        let mut r_x = self.component_tile.tile.rect.x0;
-        let mut r_y = self.component_tile.tile.rect.y0;
+        let mut r_x = u64::from(self.component_tile.tile.rect.x0);
+        let mut r_y = u64::from(self.component_tile.tile.rect.y0);
+        let precinct_x_step = u64::from(precinct_x_step);
+        let precinct_y_step = u64::from(precinct_y_step);
 
         // The second part of the condition in the formula in B.12.1.3. If it
         // is divisible, then we can't take the x/y position of the tile
         // as the start of the precinct, but instead have to advance to the
         // next multiple.
         if !r_x.is_multiple_of(precinct_x_step)
-            && (self.rect.x0 * (1 << nl_minus_r)).is_multiple_of(x_stride)
+            && (u64::from(self.rect.x0) << nl_minus_r).is_multiple_of(u64::from(x_stride))
         {
-            r_x = r_x.checked_next_multiple_of(precinct_x_step)?;
+            r_x = r_x.next_multiple_of(precinct_x_step);
         }
 
         // Same as above.
         if !r_y.is_multiple_of(precinct_y_step)
-            && (self.rect.y0 * (1 << nl_minus_r)).is_multiple_of(y_stride)
+            && (u64::from(self.rect.y0) << nl_minus_r).is_multiple_of(u64::from(y_stride))
         {
-            r_y = r_y.checked_next_multiple_of(precinct_y_step)?;
+            r_y = r_y.next_multiple_of(precinct_y_step);
         }
 
         let iter = (0..num_precincts_y).flat_map(move |y| {
@@ -753,7 +725,14 @@ impl<'a> ResolutionTile<'a> {
                 let data = PrecinctData {
                     r_x,
                     r_y,
-                    rect: IntRect::from_xywh(x0, y0, ppx_pow2, ppy_pow2),
+                    // The last precinct can extend past the reference grid.
+                    // Clip its exclusive end to the largest possible sub-band end.
+                    rect: IntRect::from_ltrb(
+                        x0,
+                        y0,
+                        x0.saturating_add(ppx_pow2),
+                        y0.saturating_add(ppy_pow2),
+                    ),
                     idx: num_precincts_x as u64 * y as u64 + x as u64,
                 };
 
@@ -816,7 +795,7 @@ struct TilePartHeader {
     tile_part_length: u32,
 }
 
-struct PptMarkerData<'a> {
+pub(super) struct PptMarkerData<'a> {
     data: &'a [u8],
     sequence_idx: u8,
 }
@@ -959,7 +938,9 @@ mod tests {
             strict: false,
         };
 
-        let tile_0_0 = Tile::new(0, &header);
+        let settings = DecodeSettings::default();
+        let mut budget = BuildBudget::new(0, &settings);
+        let tile_0_0 = Tile::new(0, &header, &mut budget).unwrap();
         let coords_0_0 = ComponentTile::new(&tile_0_0, &component_info_0).rect;
         assert_eq!(coords_0_0.x0, 152);
         assert_eq!(coords_0_0.y0, 234);
@@ -968,7 +949,7 @@ mod tests {
         assert_eq!(coords_0_0.width(), 244);
         assert_eq!(coords_0_0.height(), 63);
 
-        let tile_1_0 = Tile::new(1, &header);
+        let tile_1_0 = Tile::new(1, &header, &mut budget).unwrap();
         let coords_1_0 = ComponentTile::new(&tile_1_0, &component_info_0).rect;
         assert_eq!(coords_1_0.x0, 396);
         assert_eq!(coords_1_0.y0, 234);
@@ -977,7 +958,7 @@ mod tests {
         assert_eq!(coords_1_0.width(), 396);
         assert_eq!(coords_1_0.height(), 63);
 
-        let tile_0_1 = Tile::new(4, &header);
+        let tile_0_1 = Tile::new(4, &header, &mut budget).unwrap();
         let coords_0_1 = ComponentTile::new(&tile_0_1, &component_info_0).rect;
         assert_eq!(coords_0_1.x0, 152);
         assert_eq!(coords_0_1.y0, 297);
@@ -986,7 +967,7 @@ mod tests {
         assert_eq!(coords_0_1.width(), 244);
         assert_eq!(coords_0_1.height(), 297);
 
-        let tile_1_1 = Tile::new(5, &header);
+        let tile_1_1 = Tile::new(5, &header, &mut budget).unwrap();
         let coords_1_1 = ComponentTile::new(&tile_1_1, &component_info_0).rect;
         assert_eq!(coords_1_1.x0, 396);
         assert_eq!(coords_1_1.y0, 297);
@@ -995,7 +976,7 @@ mod tests {
         assert_eq!(coords_1_1.width(), 396);
         assert_eq!(coords_1_1.height(), 297);
 
-        let tile_3_3 = Tile::new(15, &header);
+        let tile_3_3 = Tile::new(15, &header, &mut budget).unwrap();
         let coords_3_3 = ComponentTile::new(&tile_3_3, &component_info_0).rect;
         assert_eq!(coords_3_3.x0, 1188);
         assert_eq!(coords_3_3.y0, 891);
@@ -1036,7 +1017,7 @@ mod tests {
         assert_eq!(tile_1_1_comp1.width(), 198);
         assert_eq!(tile_1_1_comp1.height(), 148);
 
-        let tile_2_1 = Tile::new(6, &header);
+        let tile_2_1 = Tile::new(6, &header, &mut budget).unwrap();
         let tile_2_1_comp1 = ComponentTile::new(&tile_2_1, &component_info_1).rect;
         assert_eq!(tile_2_1_comp1.x0, 396);
         assert_eq!(tile_2_1_comp1.y0, 149);

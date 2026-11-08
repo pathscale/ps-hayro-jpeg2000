@@ -2,11 +2,12 @@
 
 use alloc::vec::Vec;
 
-use crate::error::{FormatError, Result, bail};
+use crate::error::{FormatError, Result, ValidationError, bail};
+use crate::j2c::BuildBudget;
 use crate::jp2::ImageBoxes;
 use crate::reader::BitReader;
 
-pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
+pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8], budget: &mut BuildBudget<'_>) -> Result<()> {
     let mut reader = BitReader::new(data);
     let num_entries = reader.read_u16().ok_or(FormatError::InvalidBox)? as usize;
     let num_components = reader.read_byte().ok_or(FormatError::InvalidBox)? as usize;
@@ -15,7 +16,8 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
         bail!(FormatError::InvalidBox);
     }
 
-    let mut columns = Vec::with_capacity(num_components);
+    let mut columns = Vec::new();
+    budget.reserve_exact(&mut columns, num_components)?;
     for _ in 0..num_components {
         let descriptor = reader.read_byte().ok_or(FormatError::InvalidBox)?;
         let bit_depth = (descriptor & 0x7F)
@@ -30,10 +32,12 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
         columns.push(PaletteColumn { bit_depth });
     }
 
-    let mut entries = Vec::with_capacity(num_entries);
+    let mut entries = Vec::new();
+    budget.reserve_exact(&mut entries, num_entries)?;
 
     for _ in 0..num_entries {
-        let mut row = Vec::with_capacity(num_components);
+        let mut row = Vec::new();
+        budget.reserve_exact(&mut row, num_components)?;
 
         for column in &columns {
             let num_bytes = (column.bit_depth as usize).div_ceil(8).max(1);
@@ -51,7 +55,13 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
         entries.push(row);
     }
 
-    boxes.palette = Some(PaletteBox { entries, columns });
+    if let Some(old) = boxes.palette.replace(PaletteBox { entries, columns }) {
+        let cells = old.entries.len().checked_mul(old.columns.len())
+            .ok_or(ValidationError::MemoryLimitExceeded)?;
+        budget.release_bytes(BuildBudget::bytes::<u64>(cells)?)?;
+        budget.release_bytes(BuildBudget::bytes::<Vec<u64>>(old.entries.len())?)?;
+        budget.release_bytes(BuildBudget::bytes::<PaletteColumn>(old.columns.len())?)?;
+    }
 
     Ok(())
 }

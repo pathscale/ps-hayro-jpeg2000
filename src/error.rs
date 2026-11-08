@@ -71,8 +71,8 @@ pub enum ValidationError {
     ImageTooLarge,
     /// Decoded pixel count exceeds the configured limit.
     PixelLimitExceeded,
-    /// Estimated tile metadata, construction entries, component planes,
-    /// palette expansion, or reconstruction buffers exceed the byte limit.
+    /// Estimated heap payload for parsing or decoding exceeds the byte limit,
+    /// or a checked allocation could not be reserved.
     MemoryLimitExceeded,
     /// Image has too many channels.
     TooManyChannels,

@@ -1,35 +1,36 @@
 //! Parsing of layers and their segments, as specified in Annex B.
 
-use alloc::boxed::Box;
-
-use super::build::Segment;
+use super::build::{BuildBudget, Segment};
 use super::codestream::markers::{EPH, SOP};
 use super::codestream::{ComponentInfo, Header};
 use super::decode::DecompositionStorage;
 use super::progression::ProgressionData;
-use super::tile::{Tile, TilePart};
-use crate::error::{Result, TileError, bail};
+use super::tile::TilePart;
+use crate::error::{DecodeError, Result, TileError, bail};
 use crate::reader::BitReader;
 
 pub(crate) const MAX_BITPLANE_COUNT: u8 = 32;
 
-pub(crate) fn parse<'a, 'b>(
-    tile: &'b Tile<'a>,
-    mut progression_iterator: Box<dyn Iterator<Item = ProgressionData> + '_>,
+pub(crate) fn parse<'a>(
+    tile_parts: &mut [TilePart<'a>],
+    component_infos: &[ComponentInfo],
+    mut progression_iterator: impl Iterator<Item = ProgressionData>,
+    deduplicate: bool,
     header: &Header<'_>,
     storage: &mut DecompositionStorage<'a>,
+    budget: &mut BuildBudget<'_>,
 ) -> Result<()> {
-    for tile_part in &tile.tile_parts {
-        if parse_inner(
-            tile_part.clone(),
+    for tile_part in tile_parts {
+        match parse_inner(
+            tile_part,
             &mut progression_iterator,
-            &tile.component_infos,
+            deduplicate,
+            component_infos,
             storage,
-        )
-        .is_none()
-            && header.strict
-        {
-            bail!(TileError::Invalid);
+            budget,
+        ) {
+            Err(DecodeError::Tile(TileError::Invalid)) if !header.strict => continue,
+            result => result?,
         }
     }
 
@@ -37,13 +38,21 @@ pub(crate) fn parse<'a, 'b>(
 }
 
 fn parse_inner<'a>(
-    mut tile_part: TilePart<'a>,
+    tile_part: &mut TilePart<'a>,
     progression_iterator: &mut dyn Iterator<Item = ProgressionData>,
+    deduplicate: bool,
     component_infos: &[ComponentInfo],
     storage: &mut DecompositionStorage<'a>,
-) -> Option<()> {
+    budget: &mut BuildBudget<'_>,
+) -> Result<()> {
+    let invalid = TileError::Invalid;
     while !tile_part.header().at_end() {
-        let progression_data = progression_iterator.next()?;
+        let progression_data = loop {
+            let data = progression_iterator.next().ok_or(invalid)?;
+            if !deduplicate || mark_packet_seen(storage, &data) {
+                break data;
+            }
+        };
         let resolution = progression_data.resolution;
         let component_info = &component_infos[progression_data.component as usize];
         let tile_decompositions =
@@ -55,13 +64,13 @@ fn parse_inner<'a>(
         if component_info.coding_style.flags.may_use_sop_markers()
             && body_reader.peek_marker() == Some(SOP)
         {
-            body_reader.read_marker().ok()?;
-            body_reader.skip_bytes(4)?;
+            body_reader.read_marker().map_err(|_| invalid)?;
+            body_reader.skip_bytes(4).ok_or(invalid)?;
         }
 
         let header_reader = tile_part.header();
 
-        let zero_length = header_reader.read_bits_with_stuffing(1)? == 0;
+        let zero_length = header_reader.read_bits_with_stuffing(1).ok_or(invalid)? == 0;
 
         // B.10.3 Zero length packet
         // "The first bit in the packet header denotes whether the packet has a length of zero
@@ -75,6 +84,7 @@ fn parse_inner<'a>(
                     header_reader,
                     storage,
                     component_info,
+                    budget,
                 )?;
             }
         }
@@ -82,9 +92,9 @@ fn parse_inner<'a>(
         header_reader.align();
 
         if component_info.coding_style.flags.uses_eph_marker()
-            && header_reader.read_marker().ok()? != EPH
+            && header_reader.read_marker().map_err(|_| invalid)? != EPH
         {
-            return None;
+            bail!(TileError::Invalid);
         }
 
         // Now read the packet body.
@@ -105,7 +115,9 @@ fn parse_inner<'a>(
                         let segments = &mut storage.segments[segments.clone()];
 
                         for segment in segments {
-                            segment.data = body_reader.read_bytes(segment.data_length as usize)?;
+                            segment.data = body_reader
+                                .read_bytes(segment.data_length as usize)
+                                .ok_or(invalid)?;
                         }
                     }
                 }
@@ -113,7 +125,22 @@ fn parse_inner<'a>(
         }
     }
 
-    Some(())
+    Ok(())
+}
+
+// Every resolution has a precinct entry for each packet position in its first
+// sub-band, even where that precinct has no code-blocks. POC ranges start at
+// layer zero, so use that existing entry to suppress overlapping packets.
+fn mark_packet_seen(storage: &mut DecompositionStorage<'_>, data: &ProgressionData) -> bool {
+    let tile = &storage.tile_decompositions[data.component as usize];
+    let sub_band = tile.sub_band_iter(data.resolution, &storage.decompositions)
+        .next().unwrap();
+    let precinct = &mut storage.precincts[storage.sub_bands[sub_band].precincts.start
+        + data.precinct as usize];
+    let layer = 1_u32 << data.layer_num;
+    let first = precinct.visited_layers & layer == 0;
+    precinct.visited_layers |= layer;
+    first
 }
 
 fn resolve_segments(
@@ -122,7 +149,9 @@ fn resolve_segments(
     reader: &mut BitReader<'_>,
     storage: &mut DecompositionStorage<'_>,
     component_info: &ComponentInfo,
-) -> Option<()> {
+    budget: &mut BuildBudget<'_>,
+) -> Result<()> {
+    let invalid = TileError::Invalid;
     // We don't support more than 32-bit precision.
     const MAX_CODING_PASSES: u8 = 1 + 3 * (MAX_BITPLANE_COUNT - 1);
 
@@ -131,7 +160,7 @@ fn resolve_segments(
     let Some(precinct) = precincts.get_mut(progression_data.precinct as usize) else {
         // An invalid file could trigger this code path.
 
-        return None;
+        bail!(TileError::Invalid);
     };
     let code_blocks = &mut storage.code_blocks[precinct.code_blocks.clone()];
 
@@ -142,7 +171,7 @@ fn resolve_segments(
             // a single bit is used to represent the information, where a 1
             // means that the code-block is included in this layer and a 0 means
             // that it is not."
-            reader.read_bits_with_stuffing(1)? == 1
+            reader.read_bits_with_stuffing(1).ok_or(invalid)? == 1
         } else {
             // "For code-blocks that have not been previously included in any packet,
             // this information is signalled with a separate tag tree code for each precinct
@@ -156,13 +185,17 @@ fn resolve_segments(
             // the current layer is included. If a code-block is not included until a later
             // layer, then only a partial tag tree is included at that point in the bit
             // stream."
-            precinct.code_inclusion_tree.read(
-                code_block.x_idx,
-                code_block.y_idx,
-                reader,
-                progression_data.layer_num as u32 + 1,
-                &mut storage.tag_tree_nodes,
-            )? <= progression_data.layer_num as u32
+            precinct
+                .code_inclusion_tree
+                .read(
+                    code_block.x_idx,
+                    code_block.y_idx,
+                    reader,
+                    progression_data.layer_num as u32 + 1,
+                    &mut storage.tag_tree_nodes,
+                )
+                .ok_or(invalid)?
+                <= progression_data.layer_num as u32
         };
 
 
@@ -187,13 +220,16 @@ fn resolve_segments(
         // value of P is coded in the packet header with a separate tag tree for every
         // precinct, in the same manner as the code block inclusion information."
         if included_first_time {
-            code_block.missing_bit_planes = precinct.zero_bitplane_tree.read(
-                code_block.x_idx,
-                code_block.y_idx,
-                reader,
-                u32::MAX,
-                &mut storage.tag_tree_nodes,
-            )? as u8;
+            code_block.missing_bit_planes = precinct
+                .zero_bitplane_tree
+                .read(
+                    code_block.x_idx,
+                    code_block.y_idx,
+                    reader,
+                    u32::MAX,
+                    &mut storage.tag_tree_nodes,
+                )
+                .ok_or(invalid)? as u8;
         }
 
         code_block.has_been_included |= is_included;
@@ -203,44 +239,46 @@ fn resolve_segments(
         // identified in the packet header using the codewords shown in Table B.4. This
         // table provides for the possibility of signalling up to 164 coding passes."
         let added_coding_passes = if reader.peak_bits_with_stuffing(9) == Some(0x1ff) {
-            reader.read_bits_with_stuffing(9)?;
-            reader.read_bits_with_stuffing(7)? + 37
+            reader.read_bits_with_stuffing(9).ok_or(invalid)?;
+            reader.read_bits_with_stuffing(7).ok_or(invalid)? + 37
         } else if reader.peak_bits_with_stuffing(4) == Some(0x0f) {
-            reader.read_bits_with_stuffing(4)?;
-            reader.read_bits_with_stuffing(5)? + 6
+            reader.read_bits_with_stuffing(4).ok_or(invalid)?;
+            reader.read_bits_with_stuffing(5).ok_or(invalid)? + 6
         } else if reader.peak_bits_with_stuffing(4) == Some(0b1110) {
-            reader.read_bits_with_stuffing(4)?;
+            reader.read_bits_with_stuffing(4).ok_or(invalid)?;
             5
         } else if reader.peak_bits_with_stuffing(4) == Some(0b1101) {
-            reader.read_bits_with_stuffing(4)?;
+            reader.read_bits_with_stuffing(4).ok_or(invalid)?;
             4
         } else if reader.peak_bits_with_stuffing(4) == Some(0b1100) {
-            reader.read_bits_with_stuffing(4)?;
+            reader.read_bits_with_stuffing(4).ok_or(invalid)?;
             3
         } else if reader.peak_bits_with_stuffing(2) == Some(0b10) {
-            reader.read_bits_with_stuffing(2)?;
+            reader.read_bits_with_stuffing(2).ok_or(invalid)?;
             2
         } else if reader.peak_bits_with_stuffing(1) == Some(0) {
-            reader.read_bits_with_stuffing(1)?;
+            reader.read_bits_with_stuffing(1).ok_or(invalid)?;
             1
         } else {
-            return None;
+            bail!(TileError::Invalid);
         } as u8;
 
 
         let mut k = 0;
 
-        while reader.read_bits_with_stuffing(1)? == 1 {
+        while reader.read_bits_with_stuffing(1).ok_or(invalid)? == 1 {
             k += 1;
         }
 
         code_block.l_block += k;
 
         let previous_layers_passes = code_block.number_of_coding_passes;
-        let cumulative_passes = previous_layers_passes.checked_add(added_coding_passes)?;
+        let cumulative_passes = previous_layers_passes
+            .checked_add(added_coding_passes)
+            .ok_or(invalid)?;
 
         if cumulative_passes > MAX_CODING_PASSES {
-            return None;
+            bail!(TileError::Invalid);
         }
 
         let get_segment_idx = |pass_idx: u8| {
@@ -263,7 +301,7 @@ fn resolve_segments(
 
         let start = storage.segments.len();
 
-        let mut push_segment = |segment: u8, coding_passes_for_segment: u8| {
+        let mut push_segment = |segment: u8, coding_passes_for_segment: u8| -> Result<()> {
             let length = {
                 assert!(coding_passes_for_segment > 0);
 
@@ -279,9 +317,12 @@ fn resolve_segments(
                 // the number of bits used to signal the length of the code-block contribution can
                 // increase or decrease depending on the number of coding passes included."
                 let length_bits = code_block.l_block + coding_passes_for_segment.ilog2();
-                reader.read_bits_with_stuffing(length_bits as u8)
-            }?;
+                reader
+                    .read_bits_with_stuffing(length_bits as u8)
+                    .ok_or(invalid)?
+            };
 
+            budget.reserve(&mut storage.segments, 1)?;
             storage.segments.push(Segment {
                 idx: segment,
                 data_length: length,
@@ -290,8 +331,7 @@ fn resolve_segments(
                 data: &[],
             });
 
-
-            Some(())
+            Ok(())
         };
 
         let mut last_segment = get_segment_idx(previous_layers_passes);
@@ -320,7 +360,7 @@ fn resolve_segments(
         code_block.non_empty_layer_count += 1;
     }
 
-    Some(())
+    Ok(())
 }
 
 /// Calculate the segment index for the given pass in arithmetic decoder

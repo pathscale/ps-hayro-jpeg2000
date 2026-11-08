@@ -13,10 +13,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::arithmetic_decoder::{ArithmeticDecoder, ArithmeticDecoderContext};
-use super::build::{CodeBlock, SubBandType};
+use super::build::{BuildBudget, CodeBlock, SubBandType};
 use super::codestream::CodeBlockStyle;
 use super::decode::{DecompositionStorage, TileDecodeContext};
-use crate::error::{DecodingError, Result, bail};
+use crate::error::{DecodingError, Result, ValidationError, bail};
 use crate::reader::BitReader;
 
 /// Decode the layers of the given code block into coefficients.
@@ -31,25 +31,25 @@ pub(crate) fn decode(
     tile_ctx: &mut TileDecodeContext,
     storage: &DecompositionStorage<'_>,
     strict: bool,
+    mut budget: BuildBudget<'_>,
 ) -> Result<()> {
+    tile_ctx.bit_plane_decode_buffers.clear();
     tile_ctx.bit_plane_decode_context.reset(
         code_block,
         sub_band_type,
         style,
         total_bitplanes,
         strict,
+        &mut budget,
     )?;
-    tile_ctx.bit_plane_decode_buffers.reset();
 
     decode_inner(
         code_block,
         storage,
         &mut tile_ctx.bit_plane_decode_context,
         &mut tile_ctx.bit_plane_decode_buffers,
+        &mut budget,
     )
-    .ok_or(DecodingError::CodeBlockDecodeFailure)?;
-
-    Ok(())
 }
 
 fn decode_inner(
@@ -57,33 +57,41 @@ fn decode_inner(
     storage: &DecompositionStorage<'_>,
     ctx: &mut BitPlaneDecodeContext,
     bp_buffers: &mut BitPlaneDecodeBuffers,
-) -> Option<()> {
-    bp_buffers.reset();
+    budget: &mut BuildBudget<'_>,
+) -> Result<()> {
+    let invalid = DecodingError::CodeBlockDecodeFailure;
 
     // A single contribution is already contiguous in the borrowed input.
     // Normal mode also concatenates contributions across layers when needed.
     let mut segments = storage.layers[code_block.layers.clone()].iter()
         .filter_map(|layer| layer.segments.clone())
         .flat_map(|range| storage.segments[range].iter());
-    if let Some(segment) = segments.next()
-        && segments.next().is_none()
-    {
+    let Some(segment) = segments.next() else {
+        return if code_block.number_of_coding_passes == 0 {
+            Ok(())
+        } else {
+            Err(invalid.into())
+        };
+    };
+    if segments.next().is_none() {
         if segment.idx != 0 || segment.coding_pases != code_block.number_of_coding_passes {
-            return None;
+            bail!(invalid);
         }
         let end = segment.coding_pases.min(ctx.max_coding_passes);
         let mut decoder = ArithmeticDecoder::new(segment.data);
         let normal = !ctx.style.selective_arithmetic_coding_bypass
             && !ctx.style.termination_on_each_pass;
-        return if normal && ctx.can_use_fast_path() {
+        let decoded = if normal && ctx.can_use_fast_path() {
             fast_path::handle_coding_passes(0, end, ctx, &mut decoder)
         } else {
             handle_coding_passes(0, end, ctx, &mut decoder)
         };
+        return decoded.ok_or_else(|| invalid.into());
     }
 
     let mut last_segment_idx = 0;
     let mut coding_passes = 0;
+    bp_buffers.push_boundary(0, budget)?;
 
     // Build a list so that we can associate coding passes with their segments
     // and data more easily.
@@ -94,14 +102,12 @@ fn decode_inner(
                 if segment.idx != last_segment_idx {
                     assert_eq!(segment.idx, last_segment_idx + 1);
 
-                    bp_buffers
-                        .segment_ranges
-                        .push(bp_buffers.combined_layers.len());
-                    bp_buffers.segment_coding_passes.push(coding_passes);
+                    bp_buffers.push_boundary(coding_passes, budget)?;
                     last_segment_idx += 1;
                 }
 
-                bp_buffers.combined_layers.extend(segment.data);
+                budget.reserve(&mut bp_buffers.combined_layers, segment.data.len())?;
+                bp_buffers.combined_layers.extend_from_slice(segment.data);
                 coding_passes += segment.coding_pases;
             }
         }
@@ -109,10 +115,7 @@ fn decode_inner(
 
     assert_eq!(coding_passes, code_block.number_of_coding_passes);
 
-    bp_buffers
-        .segment_ranges
-        .push(bp_buffers.combined_layers.len());
-    bp_buffers.segment_coding_passes.push(coding_passes);
+    bp_buffers.push_boundary(coding_passes, budget)?;
 
     let is_normal_mode =
         !ctx.style.selective_arithmetic_coding_bypass && !ctx.style.termination_on_each_pass;
@@ -126,9 +129,9 @@ fn decode_inner(
             .min(ctx.max_coding_passes);
 
         if ctx.can_use_fast_path() {
-            fast_path::handle_coding_passes(0, end, ctx, &mut decoder)?;
+            fast_path::handle_coding_passes(0, end, ctx, &mut decoder).ok_or(invalid)?;
         } else {
-            handle_coding_passes(0, end, ctx, &mut decoder)?;
+            handle_coding_passes(0, end, ctx, &mut decoder).ok_or(invalid)?;
         }
     } else {
         // Otherwise, each segment introduces a termination. For "termination on
@@ -157,15 +160,17 @@ fn decode_inner(
 
             if use_arithmetic {
                 let mut decoder = ArithmeticDecoder::new(data);
-                handle_coding_passes(start_coding_pass, end_coding_pass, ctx, &mut decoder)?;
+                handle_coding_passes(start_coding_pass, end_coding_pass, ctx, &mut decoder)
+                    .ok_or(invalid)?;
             } else {
                 let mut decoder = BypassDecoder::new(data, ctx.strict);
-                handle_coding_passes(start_coding_pass, end_coding_pass, ctx, &mut decoder)?;
+                handle_coding_passes(start_coding_pass, end_coding_pass, ctx, &mut decoder)
+                    .ok_or(invalid)?;
             }
         }
     }
 
-    Some(())
+    Ok(())
 }
 
 fn handle_coding_passes(
@@ -404,15 +409,19 @@ pub(crate) struct BitPlaneDecodeBuffers {
 }
 
 impl BitPlaneDecodeBuffers {
-    fn reset(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.combined_layers.clear();
         self.segment_ranges.clear();
         self.segment_coding_passes.clear();
 
-        // The design of these two buffers is that the ranges are stored
-        // as [idx, idx + 1), so we need to store the first 0 when resetting.
-        self.segment_ranges.push(0);
-        self.segment_coding_passes.push(0);
+    }
+
+    fn push_boundary(&mut self, coding_passes: u8, budget: &mut BuildBudget<'_>) -> Result<()> {
+        budget.reserve(&mut self.segment_ranges, 1)?;
+        budget.reserve(&mut self.segment_coding_passes, 1)?;
+        self.segment_ranges.push(self.combined_layers.len());
+        self.segment_coding_passes.push(coding_passes);
+        Ok(())
     }
 }
 
@@ -474,6 +483,13 @@ impl BitPlaneDecodeContext {
         self.height.is_multiple_of(4) && !self.style.vertically_causal_context
     }
 
+    pub(crate) fn clear_workspace(&mut self) {
+        self.coefficients.clear();
+        self.neighbor_significances.clear();
+        self.coefficient_states.clear();
+        self.stripe_flags.clear();
+    }
+
     /// Completely reset context so that it can be reused for a new code-block.
     pub(crate) fn reset(
         &mut self,
@@ -482,27 +498,32 @@ impl BitPlaneDecodeContext {
         code_block_style: &CodeBlockStyle,
         total_bitplanes: u8,
         strict: bool,
+        budget: &mut BuildBudget<'_>,
     ) -> Result<()> {
         let (width, height) = (code_block.rect.width(), code_block.rect.height());
-        let padded_width = width + COEFFICIENTS_PADDING * 2;
-        let padded_height = height + COEFFICIENTS_PADDING * 2;
-        let num_coefficients = padded_width as usize * padded_height as usize;
+        let error = ValidationError::MemoryLimitExceeded;
+        let padded_width = width.checked_add(COEFFICIENTS_PADDING * 2).ok_or(error)?;
+        let padded_height = height.checked_add(COEFFICIENTS_PADDING * 2).ok_or(error)?;
+        let area = |height: u32| usize::try_from(u64::from(height) * u64::from(padded_width))
+            .map_err(|_| error);
+        let num_coefficients = area(padded_height)?;
+        let stripe_flags = area(height.div_ceil(4).checked_add(2).ok_or(error)?)?;
 
-        self.coefficients.clear();
+        self.clear_workspace();
+        budget.reserve(&mut self.coefficients, num_coefficients)?;
         self.coefficients
             .resize(num_coefficients, Coefficient::default());
 
-        self.neighbor_significances.clear();
+        budget.reserve(&mut self.neighbor_significances, num_coefficients)?;
         self.neighbor_significances
             .resize(num_coefficients, NeighborSignificances::default());
 
-        self.coefficient_states.clear();
+        budget.reserve(&mut self.coefficient_states, num_coefficients)?;
         self.coefficient_states
             .resize(num_coefficients, CoefficientState::default());
 
-        self.stripe_flags.clear();
-        self.stripe_flags
-            .resize((height.div_ceil(4) + 2) as usize * padded_width as usize, 0);
+        budget.reserve(&mut self.stripe_flags, stripe_flags)?;
+        self.stripe_flags.resize(stripe_flags, 0);
 
         self.width = width;
         self.padded_width = padded_width;

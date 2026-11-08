@@ -27,7 +27,8 @@ pub(crate) fn decode<'a>(
     ctx: &mut DecoderContext<'a>,
     settings: &crate::DecodeSettings,
     palette_components: usize,
-) -> Result<()> {
+    metadata_bytes: usize,
+) -> Result<usize> {
     let tile_count = header.size_data.num_tiles()?;
     if tile_count > 65_536 {
         return Err(crate::error::ValidationError::ImageTooLarge.into());
@@ -37,23 +38,26 @@ pub(crate) fn decode<'a>(
         .map_err(|_| crate::error::ValidationError::MemoryLimitExceeded)?;
     let tile_bytes = super::limits::tile_table_bytes(header, tile_count)?;
     let planes = super::limits::raw_plane_bytes(header, samples)?;
-    super::limits::check_total_bytes(
-        tile_bytes
-            .checked_add(planes)
-            .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?,
-        settings,
-    )?;
+    let fixed = metadata_bytes.checked_add(planes)
+        .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
+    let tile_preflight = fixed.checked_add(tile_bytes)
+        .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
+    super::limits::check_total_bytes(tile_preflight, settings)?;
+    // Previous output and scratch must be dropped before tile metadata grows.
+    *ctx = DecoderContext::default();
     let mut reader = BitReader::new(data);
-    let (tiles, tile_bytes) = tile::parse(&mut reader, header, tile_bytes, planes, settings)?;
+    let (mut tiles, tile_bytes) = tile::parse(&mut reader, header, fixed, settings)?;
 
     if tiles.is_empty() {
         bail!(TileError::Invalid);
     }
 
-    let sizes = BufferSizes::new(header, &tiles, settings, palette_components, tile_bytes)?;
-    ctx.reset(header, &sizes);
+    let retained = metadata_bytes.checked_add(tile_bytes)
+        .ok_or(crate::error::ValidationError::MemoryLimitExceeded)?;
+    let sizes = BufferSizes::new(header, &tiles, settings, palette_components, retained)?;
+    ctx.allocate_buffers(header, &sizes);
 
-    for tile in &tiles {
+    for tile in &mut tiles {
         decode_tile(
             tile,
             header,
@@ -66,7 +70,15 @@ pub(crate) fn decode<'a>(
 
     apply_sign_shift(&mut ctx.channel_data, &header.component_infos);
 
-    Ok(())
+    // These entries are no longer live during the palette/CDEF phase. Retain
+    // capacity for reuse without carrying tile payload into its estimate.
+    ctx.storage.reset();
+    ctx.storage.coefficients.clear();
+    ctx.tile_decode_context.idwt_output.coefficients.clear();
+    ctx.tile_decode_context.idwt_scratch_buffer.clear();
+    let output_planes = if palette_components == 0 { planes } else { sizes.palette_bytes };
+    metadata_bytes.checked_add(output_planes)
+        .ok_or_else(|| crate::error::ValidationError::MemoryLimitExceeded.into())
 }
 
 /// A decoder context for decoding JPEG2000 images.
@@ -79,12 +91,7 @@ pub struct DecoderContext<'a> {
 }
 
 impl DecoderContext<'_> {
-    fn reset(&mut self, header: &Header<'_>, sizes: &BufferSizes) {
-        // Drop retained buffers from earlier images before applying this
-        // image's budget. Buffers remain reusable across its tiles.
-        self.tile_decode_context = TileDecodeContext::default();
-        self.storage = DecompositionStorage::default();
-        self.channel_data.clear();
+    fn allocate_buffers(&mut self, header: &Header<'_>, sizes: &BufferSizes) {
         self.storage.coefficients = alloc::vec![0.0; sizes.coefficients];
         self.tile_decode_context.idwt_output.coefficients = Vec::with_capacity(sizes.output);
         self.tile_decode_context.idwt_scratch_buffer = Vec::with_capacity(sizes.scratch);
@@ -99,13 +106,13 @@ impl DecoderContext<'_> {
     }
 }
 
-fn decode_tile<'a, 'b>(
-    tile: &'b Tile<'a>,
+fn decode_tile<'a>(
+    tile: &mut Tile<'a>,
     header: &Header<'_>,
     tile_ctx: &mut TileDecodeContext,
     channel_data: &mut [ComponentData],
     storage: &mut DecompositionStorage<'a>,
-    budget: build::BuildBudget<'_>,
+    mut budget: build::BuildBudget<'_>,
 ) -> Result<()> {
     storage.reset();
 
@@ -113,10 +120,24 @@ fn decode_tile<'a, 'b>(
 
     // First, we build the decompositions, including their sub-bands, precincts
     // and code blocks.
-    build::build(tile, storage, header.skipped_resolution_levels, budget)?;
+    build::build(tile, storage, header.skipped_resolution_levels, &mut budget)?;
     // Next, we parse the layers/segments for each code block.
-    let progression_iterator = progression_iterator(tile, header)?;
-    segment::parse(tile, progression_iterator, header, storage)?;
+    let mut parts = core::mem::take(&mut tile.tile_parts);
+    let construction_bytes = budget.total();
+    let (progression, deduplicate) = progression_iterator(tile, header, &mut budget)?;
+    let progression_bytes = budget.total() - construction_bytes;
+    segment::parse(
+        &mut parts,
+        &tile.component_infos,
+        progression,
+        deduplicate,
+        header,
+        storage,
+        &mut budget,
+    )?;
+    budget.release_bytes(progression_bytes)?;
+    // Keep the same retained tile-table estimate for all tiles in this image.
+    tile.tile_parts = parts;
 
     // Interleave bitplane decoding, IDWT, and storage for each component tile
     // so we can reuse the coefficient and IDWT buffers.
@@ -127,7 +148,7 @@ fn decode_tile<'a, 'b>(
         }
         // We then decode the bitplanes of each code block, yielding the
         // (possibly dequantized) coefficients of each code block.
-        decode_component_tile_bit_planes(idx, tile, tile_ctx, storage, header)?;
+        decode_component_tile_bit_planes(idx, tile, tile_ctx, storage, header, budget)?;
         // Next, we apply the inverse discrete wavelet transform.
         idwt::apply(
             storage,
@@ -147,6 +168,8 @@ fn decode_tile<'a, 'b>(
         );
     }
 
+    tile_ctx.bit_plane_decode_context.clear_workspace();
+    tile_ctx.bit_plane_decode_buffers.clear();
     if tile.mct {
         mct::apply_inverse(channel_data, tile, header)?;
     }
@@ -268,6 +291,7 @@ fn decode_component_tile_bit_planes<'a>(
     tile_ctx: &mut TileDecodeContext,
     storage: &mut DecompositionStorage<'a>,
     header: &Header<'_>,
+    budget: build::BuildBudget<'_>,
 ) -> Result<()> {
     let component_info = &tile.component_infos[component_idx];
 
@@ -284,6 +308,7 @@ fn decode_component_tile_bit_planes<'a>(
                 tile_ctx,
                 storage,
                 header,
+                budget,
             )?;
         }
     }
@@ -298,6 +323,7 @@ fn decode_sub_band_bitplanes(
     tile_ctx: &mut TileDecodeContext,
     storage: &mut DecompositionStorage<'_>,
     header: &Header<'_>,
+    budget: build::BuildBudget<'_>,
 ) -> Result<()> {
     let sub_band = &storage.sub_bands[sub_band_idx];
 
@@ -360,6 +386,7 @@ fn decode_sub_band_bitplanes(
                 tile_ctx,
                 storage,
                 header.strict,
+                budget,
             )?;
 
             // Turn the signs and magnitudes into singular coefficients and
@@ -369,7 +396,8 @@ fn decode_sub_band_bitplanes(
             let y_offset = code_block.rect.y0 - sub_band.rect.y0;
 
             let base_store = &mut storage.coefficients[sub_band.coefficients.clone()];
-            let mut base_idx = (y_offset * sub_band.rect.width()) as usize + x_offset as usize;
+            let mut base_idx = y_offset as usize * sub_band.rect.width() as usize
+                + x_offset as usize;
 
             for (coefficients, coefficient_states) in
                 tile_ctx.bit_plane_decode_context.coefficient_rows()

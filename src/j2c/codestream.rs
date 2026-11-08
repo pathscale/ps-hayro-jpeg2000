@@ -1,11 +1,10 @@
 //! Read and decode a JPEG2000 codestream, as described in Annex A.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use super::DecodeSettings;
 use super::bitplane::BITPLANE_BIT_SIZE;
-use super::build::SubBandType;
+use super::build::{BuildBudget, SubBandType};
 use crate::error::{MarkerError, Result, ValidationError, bail, err};
 use crate::reader::BitReader;
 
@@ -26,63 +25,74 @@ pub(crate) struct Header<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PpmMarkerData<'a> {
-    pub(crate) sequence_idx: u8,
-    pub(crate) packets: Vec<PpmPacket<'a>>,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct PpmPacket<'a> {
     pub(crate) data: &'a [u8],
+    sequence_idx: u8,
 }
 
 pub(crate) fn read_header<'a>(
     reader: &mut BitReader<'a>,
     settings: &DecodeSettings,
+    budget: &mut BuildBudget<'_>,
 ) -> Result<Header<'a>> {
     if reader.read_marker()? != markers::SIZ {
         bail!(MarkerError::Expected("SIZ"));
     }
 
-    let mut size_data = size_marker(reader)?;
+    let mut size_data = size_marker(reader, budget)?;
     size_data.num_tiles()?;
 
-    let mut cod = None;
-    let mut qcd = None;
+    let mut cod: Option<CodingStyleDefault> = None;
+    let mut qcd: Option<QuantizationInfo> = None;
 
     let num_components = size_data.component_sizes.len() as u16;
-    let mut cod_components = vec![None; num_components as usize];
-    let mut qcd_components = vec![None; num_components as usize];
-    let mut roi_shifts = vec![0; num_components as usize];
-    let mut ppm_markers = vec![];
-    let mut progression_changes = vec![];
+    let count = usize::from(num_components);
+    let mut cod_components: Vec<Option<CodingStyleComponent>> = Vec::new();
+    budget.reserve_exact(&mut cod_components, count)?;
+    cod_components.resize_with(count, || None);
+    let mut qcd_components: Vec<Option<QuantizationInfo>> = Vec::new();
+    budget.reserve_exact(&mut qcd_components, count)?;
+    qcd_components.resize_with(count, || None);
+    let mut roi_shifts = Vec::new();
+    budget.reserve_exact(&mut roi_shifts, count)?;
+    roi_shifts.resize(count, 0_u8);
+    let mut ppm_packets = Vec::new();
+    let mut progression_changes = Vec::new();
 
     loop {
         match reader.peek_marker().ok_or(MarkerError::Invalid)? {
             markers::SOT => break,
             markers::COD => {
                 reader.read_marker()?;
-                cod = Some(cod_marker(reader).ok_or(MarkerError::ParseFailure("COD"))?);
+                if let Some(old) = cod.replace(cod_marker(reader, budget)?) {
+                    budget.release_bytes(old.component_parameters.heap_bytes()?)?;
+                }
             }
             markers::COC => {
                 reader.read_marker()?;
-                let (component_index, coc) =
-                    coc_marker(reader, num_components).ok_or(MarkerError::ParseFailure("COC"))?;
-                *cod_components
+                let (component_index, coc) = coc_marker(reader, num_components, budget)?;
+                let slot = cod_components
                     .get_mut(component_index as usize)
-                    .ok_or(MarkerError::ParseFailure("COC"))? = Some(coc);
+                    .ok_or(MarkerError::ParseFailure("COC"))?;
+                if let Some(old) = slot.replace(coc) {
+                    budget.release_bytes(old.heap_bytes()?)?;
+                }
             }
             markers::QCD => {
                 reader.read_marker()?;
-                qcd = Some(qcd_marker(reader).ok_or(MarkerError::ParseFailure("QCD"))?);
+                if let Some(old) = qcd.replace(qcd_marker(reader, budget)?) {
+                    budget.release_bytes(old.heap_bytes()?)?;
+                }
             }
             markers::QCC => {
                 reader.read_marker()?;
-                let (component_index, qcc) =
-                    qcc_marker(reader, num_components).ok_or(MarkerError::ParseFailure("QCC"))?;
-                *qcd_components
+                let (component_index, qcc) = qcc_marker(reader, num_components, budget)?;
+                let slot = qcd_components
                     .get_mut(component_index as usize)
-                    .ok_or(MarkerError::ParseFailure("QCC"))? = Some(qcc);
+                    .ok_or(MarkerError::ParseFailure("QCC"))?;
+                if let Some(old) = slot.replace(qcc) {
+                    budget.release_bytes(old.heap_bytes()?)?;
+                }
             }
             markers::RGN => {
                 reader.read_marker()?;
@@ -102,13 +112,11 @@ pub(crate) fn read_header<'a>(
             }
             markers::PPM => {
                 reader.read_marker()?;
-                ppm_markers.push(ppm_marker(reader).ok_or(MarkerError::ParseFailure("PPM"))?);
+                ppm_marker(reader, &mut ppm_packets, budget)?;
             }
             markers::POC => {
                 reader.read_marker()?;
-                progression_changes.extend(
-                    poc_marker(reader, num_components).ok_or(MarkerError::ParseFailure("POC"))?,
-                );
+                poc_marker(reader, num_components, &mut progression_changes, budget)?;
             }
             markers::CRG => {
                 reader.read_marker()?;
@@ -130,24 +138,35 @@ pub(crate) fn read_header<'a>(
     let cod = cod.ok_or(MarkerError::Missing("COD"))?;
     let qcd = qcd.ok_or(MarkerError::Missing("QCD"))?;
 
-    let component_infos: Vec<ComponentInfo> = size_data
-        .component_sizes
-        .iter()
-        .enumerate()
-        .map(|(idx, csi)| ComponentInfo {
-            size_info: *csi,
-            coding_style: cod_components[idx]
-                .clone()
-                .map(|mut c| {
-                    c.flags.raw |= cod.component_parameters.flags.raw;
-
-                    c
-                })
-                .unwrap_or(cod.component_parameters.clone()),
-            quantization_info: qcd_components[idx].clone().unwrap_or(qcd.clone()),
+    let mut component_infos = Vec::new();
+    budget.reserve_exact(&mut component_infos, count)?;
+    for (idx, &size_info) in size_data.component_sizes.iter().enumerate() {
+        let coding_style = if let Some(mut coc) = cod_components[idx].take() {
+            coc.flags.raw |= cod.component_parameters.flags.raw;
+            coc
+        } else {
+            cod.component_parameters.copy_with_budget(budget)?
+        };
+        let quantization_info = match qcd_components[idx].take() {
+            Some(qcc) => qcc,
+            None => qcd.copy_with_budget(budget)?,
+        };
+        component_infos.push(ComponentInfo {
+            size_info,
+            coding_style,
+            quantization_info,
             roi_shift: roi_shifts[idx],
-        })
-        .collect();
+        });
+    }
+    drop(cod_components);
+    drop(qcd_components);
+    drop(roi_shifts);
+    let qcd_bytes = qcd.heap_bytes()?;
+    drop(qcd);
+    budget.release_bytes(qcd_bytes)?;
+    budget.release_bytes(BuildBudget::bytes::<Option<CodingStyleComponent>>(count)?)?;
+    budget.release_bytes(BuildBudget::bytes::<Option<QuantizationInfo>>(count)?)?;
+    budget.release_bytes(BuildBudget::bytes::<u8>(count)?)?;
 
     // Components can have different number of resolution levels. In that case, we
     // can only skip as many resolution levels as the component with the smallest
@@ -181,17 +200,15 @@ pub(crate) fn read_header<'a>(
     size_data.x_resolution_shrink_factor *= 1 << skipped_resolution_levels;
     size_data.y_resolution_shrink_factor *= 1 << skipped_resolution_levels;
 
-    ppm_markers.sort_by(|p0, p1| p0.sequence_idx.cmp(&p1.sequence_idx));
+    // Packet slices all point into this codestream. Use their input positions
+    // to preserve order for equal sequence indices without allocating sort scratch.
+    ppm_packets.sort_unstable_by_key(|packet| (packet.sequence_idx, packet.data.as_ptr()));
 
     let header = Header {
         size_data,
-        global_coding_style: cod.clone(),
+        global_coding_style: cod,
         component_infos,
-        ppm_packets: ppm_markers
-            .into_iter()
-            .flat_map(|i| i.packets)
-            .filter_map(|p| if p.data.is_empty() { None } else { Some(p) })
-            .collect(),
+        ppm_packets,
         progression_changes,
         skipped_resolution_levels,
         strict: settings.strict,
@@ -438,6 +455,20 @@ pub(crate) struct QuantizationInfo {
     pub(crate) step_sizes: Vec<StepSize>,
 }
 
+impl QuantizationInfo {
+    pub(crate) fn heap_bytes(&self) -> Result<usize> {
+        BuildBudget::bytes::<StepSize>(self.step_sizes.len())
+    }
+
+    pub(crate) fn copy_with_budget(&self, budget: &mut BuildBudget<'_>) -> Result<Self> {
+        Ok(Self {
+            quantization_style: self.quantization_style,
+            guard_bits: self.guard_bits,
+            step_sizes: budget.copy_slice(&self.step_sizes)?,
+        })
+    }
+}
+
 /// Default values for coding style, from the COD marker (A.6.1).
 #[derive(Debug, Clone)]
 pub(crate) struct CodingStyleDefault {
@@ -455,6 +486,19 @@ pub(crate) struct CodingStyleComponent {
     pub(crate) parameters: CodingStyleParameters,
 }
 
+impl CodingStyleComponent {
+    pub(crate) fn heap_bytes(&self) -> Result<usize> {
+        BuildBudget::bytes::<(u8, u8)>(self.parameters.precinct_exponents.len())
+    }
+
+    pub(crate) fn copy_with_budget(&self, budget: &mut BuildBudget<'_>) -> Result<Self> {
+        Ok(Self {
+            flags: self.flags,
+            parameters: self.parameters.copy_with_budget(budget)?,
+        })
+    }
+}
+
 /// Shared parameters between the COC and COD marker (A.6.1 and A.6.2).
 #[derive(Clone, Debug)]
 pub(crate) struct CodingStyleParameters {
@@ -465,6 +509,20 @@ pub(crate) struct CodingStyleParameters {
     pub(crate) code_block_style: CodeBlockStyle,
     pub(crate) transformation: WaveletTransform,
     pub(crate) precinct_exponents: Vec<(u8, u8)>,
+}
+
+impl CodingStyleParameters {
+    pub(crate) fn copy_with_budget(&self, budget: &mut BuildBudget<'_>) -> Result<Self> {
+        Ok(Self {
+            num_decomposition_levels: self.num_decomposition_levels,
+            num_resolution_levels: self.num_resolution_levels,
+            code_block_width: self.code_block_width,
+            code_block_height: self.code_block_height,
+            code_block_style: self.code_block_style,
+            transformation: self.transformation,
+            precinct_exponents: budget.copy_slice(&self.precinct_exponents)?,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -560,8 +618,8 @@ impl SizeData {
 }
 
 /// SIZ marker (A.5.1).
-fn size_marker(reader: &mut BitReader<'_>) -> Result<SizeData> {
-    let size_data = size_marker_inner(reader).ok_or(MarkerError::ParseFailure("SIZ"))?;
+fn size_marker(reader: &mut BitReader<'_>, budget: &mut BuildBudget<'_>) -> Result<SizeData> {
+    let size_data = size_marker_inner(reader, budget)?;
 
     if size_data.tile_width == 0
         || size_data.tile_height == 0
@@ -611,42 +669,44 @@ fn size_marker(reader: &mut BitReader<'_>) -> Result<SizeData> {
     Ok(size_data)
 }
 
-fn size_marker_inner(reader: &mut BitReader<'_>) -> Option<SizeData> {
+fn size_marker_inner(reader: &mut BitReader<'_>, budget: &mut BuildBudget<'_>) -> Result<SizeData> {
+    let invalid = MarkerError::ParseFailure("SIZ");
     // Length.
-    let _ = reader.read_u16()?;
+    let _ = reader.read_u16().ok_or(invalid)?;
     // Decoder capabilities.
-    let _ = reader.read_u16()?;
+    let _ = reader.read_u16().ok_or(invalid)?;
 
-    let xsiz = reader.read_u32()?;
-    let ysiz = reader.read_u32()?;
-    let x_osiz = reader.read_u32()?;
-    let y_osiz = reader.read_u32()?;
-    let xt_siz = reader.read_u32()?;
-    let yt_siz = reader.read_u32()?;
-    let xto_siz = reader.read_u32()?;
-    let yto_siz = reader.read_u32()?;
-    let csiz = reader.read_u16()?;
+    let xsiz = reader.read_u32().ok_or(invalid)?;
+    let ysiz = reader.read_u32().ok_or(invalid)?;
+    let x_osiz = reader.read_u32().ok_or(invalid)?;
+    let y_osiz = reader.read_u32().ok_or(invalid)?;
+    let xt_siz = reader.read_u32().ok_or(invalid)?;
+    let yt_siz = reader.read_u32().ok_or(invalid)?;
+    let xto_siz = reader.read_u32().ok_or(invalid)?;
+    let yto_siz = reader.read_u32().ok_or(invalid)?;
+    let csiz = reader.read_u16().ok_or(invalid)?;
 
     if x_osiz >= xsiz || y_osiz >= ysiz {
-        return None;
+        return Err(invalid.into());
     }
 
     if csiz == 0 {
-        return None;
+        return Err(invalid.into());
     }
 
-    let mut components = Vec::with_capacity(csiz as usize);
+    let mut components = Vec::new();
+    budget.reserve_exact(&mut components, usize::from(csiz))?;
     for _ in 0..csiz {
-        let ssiz = reader.read_byte()?;
-        let x_rsiz = reader.read_byte()?;
-        let y_rsiz = reader.read_byte()?;
+        let ssiz = reader.read_byte().ok_or(invalid)?;
+        let x_rsiz = reader.read_byte().ok_or(invalid)?;
+        let y_rsiz = reader.read_byte().ok_or(invalid)?;
 
         let precision = (ssiz & 0x7F) + 1;
         let is_signed = (ssiz & 0x80) != 0;
 
         // In theory up to 38 is allowed, but we don't support more than that.
         if precision as u32 > BITPLANE_BIT_SIZE {
-            return None;
+            return Err(invalid.into());
         }
 
         components.push(ComponentSizeInfo {
@@ -679,7 +739,7 @@ fn size_marker_inner(reader: &mut BitReader<'_>) -> Option<SizeData> {
         y_shrink_factor = vr as u32;
     }
 
-    Some(SizeData {
+    Ok(SizeData {
         reference_grid_width: xsiz,
         reference_grid_height: ysiz,
         image_area_x_offset: x_osiz,
@@ -699,37 +759,41 @@ fn size_marker_inner(reader: &mut BitReader<'_>) -> Option<SizeData> {
 fn coding_style_parameters(
     reader: &mut BitReader<'_>,
     coding_style: &CodingStyleFlags,
-) -> Option<CodingStyleParameters> {
-    let num_decomposition_levels = reader.read_byte()?;
+    budget: &mut BuildBudget<'_>,
+    invalid: MarkerError,
+) -> Result<CodingStyleParameters> {
+    let num_decomposition_levels = reader.read_byte().ok_or(invalid)?;
 
     if num_decomposition_levels > MAX_RESOLUTION_COUNT {
-        return None;
+        return Err(invalid.into());
     }
 
-    let num_resolution_levels = num_decomposition_levels.checked_add(1)?;
-    let code_block_width = reader.read_byte()?.checked_add(2)?;
-    let code_block_height = reader.read_byte()?.checked_add(2)?;
+    let num_resolution_levels = num_decomposition_levels.checked_add(1).ok_or(invalid)?;
+    let code_block_width = reader.read_byte().and_then(|n| n.checked_add(2)).ok_or(invalid)?;
+    let code_block_height = reader.read_byte().and_then(|n| n.checked_add(2)).ok_or(invalid)?;
 
     // Table A.18.
     if code_block_width > 10 || code_block_height > 10 || code_block_width + code_block_height > 12
     {
-        return None;
+        return Err(invalid.into());
     }
 
-    let code_block_style = CodeBlockStyle::from_u8(reader.read_byte()?);
-    let transformation = WaveletTransform::from_u8(reader.read_byte()?).ok()?;
+    let code_block_style = CodeBlockStyle::from_u8(reader.read_byte().ok_or(invalid)?);
+    let transformation =
+        WaveletTransform::from_u8(reader.read_byte().ok_or(invalid)?).map_err(|_| invalid)?;
 
     let mut precinct_exponents = Vec::new();
+    budget.reserve_exact(&mut precinct_exponents, usize::from(num_resolution_levels))?;
     if coding_style.has_precincts() {
         // "Entropy coder with precincts defined below."
         for _ in 0..num_resolution_levels {
             // Table A.21.
-            let precinct_size = reader.read_byte()?;
+            let precinct_size = reader.read_byte().ok_or(invalid)?;
             let width_exp = precinct_size & 0xF;
             let height_exp = precinct_size >> 4;
 
             if width_exp > MAX_PRECINCT_EXPONENT || height_exp > MAX_PRECINCT_EXPONENT {
-                return None;
+                return Err(invalid.into());
             }
 
             precinct_exponents.push((width_exp, height_exp));
@@ -741,7 +805,7 @@ fn coding_style_parameters(
         }
     }
 
-    Some(CodingStyleParameters {
+    Ok(CodingStyleParameters {
         num_decomposition_levels,
         num_resolution_levels,
         code_block_width,
@@ -763,27 +827,30 @@ fn tlm_marker(reader: &mut BitReader<'_>) -> Option<()> {
 }
 
 /// PPM marker (A.7.4).
-fn ppm_marker<'a>(reader: &mut BitReader<'a>) -> Option<PpmMarkerData<'a>> {
-    let segment_len = reader.read_u16()?.checked_sub(2)? as usize;
-    let ppm_data = reader.read_bytes(segment_len)?;
-    let mut packets = vec![];
-
+fn ppm_marker<'a>(
+    reader: &mut BitReader<'a>,
+    packets: &mut Vec<PpmPacket<'a>>,
+    budget: &mut BuildBudget<'_>,
+) -> Result<()> {
+    let invalid = MarkerError::ParseFailure("PPM");
+    let segment_len = reader.read_u16().and_then(|n| n.checked_sub(2)).ok_or(invalid)?;
+    let ppm_data = reader.read_bytes(usize::from(segment_len)).ok_or(invalid)?;
     let mut reader = BitReader::new(ppm_data);
-    let sequence_idx = reader.read_byte()?;
+    let sequence_idx = reader.read_byte().ok_or(invalid)?;
 
     // TODO: Handle case where next packet doesn't have nppm parameter.
 
     while !reader.at_end() {
-        let packet_len = reader.read_u16()? as usize;
-        let data = reader.read_bytes(packet_len)?;
+        let packet_len = reader.read_u16().ok_or(invalid)? as usize;
+        let data = reader.read_bytes(packet_len).ok_or(invalid)?;
 
-        packets.push(PpmPacket { data });
+        if !data.is_empty() {
+            budget.reserve(packets, 1)?;
+            packets.push(PpmPacket { data, sequence_idx });
+        }
     }
 
-    Some(PpmMarkerData {
-        sequence_idx,
-        packets,
-    })
+    Ok(())
 }
 
 /// RGN marker (A.6.3).
@@ -813,25 +880,31 @@ pub(crate) fn skip_marker_segment(reader: &mut BitReader<'_>) -> Option<()> {
 }
 
 /// COD marker (A.6.1).
-pub(crate) fn cod_marker(reader: &mut BitReader<'_>) -> Option<CodingStyleDefault> {
+pub(crate) fn cod_marker(
+    reader: &mut BitReader<'_>,
+    budget: &mut BuildBudget<'_>,
+) -> Result<CodingStyleDefault> {
+    let invalid = MarkerError::ParseFailure("COD");
     // Length.
-    let _ = reader.read_u16()?;
+    let _ = reader.read_u16().ok_or(invalid)?;
 
-    let coding_style_flags = CodingStyleFlags::from_u8(reader.read_byte()?);
-    let progression_order = ProgressionOrder::from_u8(reader.read_byte()?).ok()?;
+    let coding_style_flags = CodingStyleFlags::from_u8(reader.read_byte().ok_or(invalid)?);
+    let progression_order =
+        ProgressionOrder::from_u8(reader.read_byte().ok_or(invalid)?).map_err(|_| invalid)?;
 
-    let num_layers = reader.read_u16()?;
+    let num_layers = reader.read_u16().ok_or(invalid)?;
 
     // We don't support more than 32-bit (and thus 32 layers).
     if num_layers == 0 || num_layers > MAX_LAYER_COUNT as u16 {
-        return None;
+        return Err(invalid.into());
     }
 
-    let mct = reader.read_byte()? == 1;
+    let mct = reader.read_byte().ok_or(invalid)? == 1;
 
-    let coding_style_parameters = coding_style_parameters(reader, &coding_style_flags)?;
+    let coding_style_parameters =
+        coding_style_parameters(reader, &coding_style_flags, budget, invalid)?;
 
-    Some(CodingStyleDefault {
+    Ok(CodingStyleDefault {
         progression_order,
         num_layers: num_layers as u8,
         mct,
@@ -846,31 +919,39 @@ pub(crate) fn cod_marker(reader: &mut BitReader<'_>) -> Option<CodingStyleDefaul
 pub(crate) fn coc_marker(
     reader: &mut BitReader<'_>,
     csiz: u16,
-) -> Option<(u16, CodingStyleComponent)> {
+    budget: &mut BuildBudget<'_>,
+) -> Result<(u16, CodingStyleComponent)> {
+    let invalid = MarkerError::ParseFailure("COC");
     // Length.
-    let _ = reader.read_u16()?;
+    let _ = reader.read_u16().ok_or(invalid)?;
 
     let component_index = if csiz < 257 {
-        reader.read_byte()? as u16
+        reader.read_byte().ok_or(invalid)? as u16
     } else {
-        reader.read_u16()?
+        reader.read_u16().ok_or(invalid)?
     };
-    let coding_style = CodingStyleFlags::from_u8(reader.read_byte()?);
+    let coding_style = CodingStyleFlags::from_u8(reader.read_byte().ok_or(invalid)?);
 
-    let parameters = coding_style_parameters(reader, &coding_style)?;
+    let parameters = coding_style_parameters(reader, &coding_style, budget, invalid)?;
 
     let coc = CodingStyleComponent {
         flags: coding_style,
         parameters,
     };
 
-    Some((component_index, coc))
+    Ok((component_index, coc))
 }
 
 /// POC marker (A.6.6).
-pub(crate) fn poc_marker(reader: &mut BitReader<'_>, csiz: u16) -> Option<Vec<ProgressionChange>> {
-    let length = reader.read_u16()?.checked_sub(2)?;
-    let mut reader = BitReader::new(reader.read_bytes(length as usize)?);
+pub(crate) fn poc_marker(
+    reader: &mut BitReader<'_>,
+    csiz: u16,
+    changes: &mut Vec<ProgressionChange>,
+    budget: &mut BuildBudget<'_>,
+) -> Result<()> {
+    let invalid = MarkerError::ParseFailure("POC");
+    let length = reader.read_u16().and_then(|n| n.checked_sub(2)).ok_or(invalid)?;
+    let mut reader = BitReader::new(reader.read_bytes(length as usize).ok_or(invalid)?);
 
     let read_component_index = |reader: &mut BitReader<'_>| {
         if csiz < 257 {
@@ -882,73 +963,93 @@ pub(crate) fn poc_marker(reader: &mut BitReader<'_>, csiz: u16) -> Option<Vec<Pr
 
     let entry_size = if csiz < 257 { 7 } else { 9 };
 
-    (0..length as usize / entry_size)
-        .map(|_| {
-            Some(ProgressionChange {
-                resolution_start: reader.read_byte()?,
-                component_start: read_component_index(&mut reader)?,
-                layer_end: reader.read_u16()?,
-                resolution_end: reader.read_byte()?,
-                component_end: match read_component_index(&mut reader)? {
-                    // See Table A.32.
-                    0 => 256,
-                    index => index,
-                },
-                progression_order: ProgressionOrder::from_u8(reader.read_byte()?).ok()?,
-            })
-        })
-        .collect()
+    let count = usize::from(length) / entry_size;
+    budget.reserve(changes, count)?;
+    for _ in 0..count {
+        changes.push(ProgressionChange {
+            resolution_start: reader.read_byte().ok_or(invalid)?,
+            component_start: read_component_index(&mut reader).ok_or(invalid)?,
+            layer_end: reader.read_u16().ok_or(invalid)?,
+            resolution_end: reader.read_byte().ok_or(invalid)?,
+            component_end: match read_component_index(&mut reader).ok_or(invalid)? {
+                // See Table A.32.
+                0 => 256,
+                index => index,
+            },
+            progression_order: ProgressionOrder::from_u8(reader.read_byte().ok_or(invalid)?)
+                .map_err(|_| invalid)?,
+        });
+    }
+    Ok(())
 }
 
 /// QCD marker (A.6.4).
-pub(crate) fn qcd_marker(reader: &mut BitReader<'_>) -> Option<QuantizationInfo> {
+pub(crate) fn qcd_marker(
+    reader: &mut BitReader<'_>,
+    budget: &mut BuildBudget<'_>,
+) -> Result<QuantizationInfo> {
+    let invalid = MarkerError::ParseFailure("QCD");
     // Length.
-    let length = reader.read_u16()?;
+    let length = reader.read_u16().ok_or(invalid)?;
 
-    let sqcd_val = reader.read_byte()?;
-    let quantization_style = QuantizationStyle::from_u8(sqcd_val & 0x1F).ok()?;
+    let sqcd_val = reader.read_byte().ok_or(invalid)?;
+    let quantization_style = QuantizationStyle::from_u8(sqcd_val & 0x1F).map_err(|_| invalid)?;
     let guard_bits = (sqcd_val >> 5) & 0x07;
 
-    let remaining_bytes = length.checked_sub(3)? as usize;
+    let remaining_bytes = length.checked_sub(3).ok_or(invalid)? as usize;
 
-    let mut parameters = quantization_parameters(reader, quantization_style, remaining_bytes)?;
+    let mut parameters =
+        quantization_parameters(reader, quantization_style, remaining_bytes, budget, invalid)?;
     parameters.guard_bits = guard_bits;
 
-    Some(parameters)
+    Ok(parameters)
 }
 
 /// QCC marker (A.6.5).
-pub(crate) fn qcc_marker(reader: &mut BitReader<'_>, csiz: u16) -> Option<(u16, QuantizationInfo)> {
-    let length = reader.read_u16()?;
+pub(crate) fn qcc_marker(
+    reader: &mut BitReader<'_>,
+    csiz: u16,
+    budget: &mut BuildBudget<'_>,
+) -> Result<(u16, QuantizationInfo)> {
+    let invalid = MarkerError::ParseFailure("QCC");
+    let length = reader.read_u16().ok_or(invalid)?;
 
     let component_index = if csiz < 257 {
-        reader.read_byte()? as u16
+        reader.read_byte().ok_or(invalid)? as u16
     } else {
-        reader.read_u16()?
+        reader.read_u16().ok_or(invalid)?
     };
 
-    let sqcc_val = reader.read_byte()?;
-    let quantization_style = QuantizationStyle::from_u8(sqcc_val & 0x1F).ok()?;
+    let sqcc_val = reader.read_byte().ok_or(invalid)?;
+    let quantization_style = QuantizationStyle::from_u8(sqcc_val & 0x1F).map_err(|_| invalid)?;
     let guard_bits = (sqcc_val >> 5) & 0x07;
 
     let component_index_size = if csiz < 257 { 1 } else { 2 };
     let remaining_bytes = length
-        .checked_sub(2)?
-        .checked_sub(component_index_size)?
-        .checked_sub(1)? as usize;
+        .checked_sub(3 + component_index_size)
+        .ok_or(invalid)? as usize;
 
-    let mut parameters = quantization_parameters(reader, quantization_style, remaining_bytes)?;
+    let mut parameters =
+        quantization_parameters(reader, quantization_style, remaining_bytes, budget, invalid)?;
     parameters.guard_bits = guard_bits;
 
-    Some((component_index, parameters))
+    Ok((component_index, parameters))
 }
 
 fn quantization_parameters(
     reader: &mut BitReader<'_>,
     quantization_style: QuantizationStyle,
     remaining_bytes: usize,
-) -> Option<QuantizationInfo> {
+    budget: &mut BuildBudget<'_>,
+    invalid: MarkerError,
+) -> Result<QuantizationInfo> {
     let mut step_sizes = Vec::new();
+    let count = match quantization_style {
+        QuantizationStyle::NoQuantization => remaining_bytes,
+        QuantizationStyle::ScalarDerived => 1,
+        QuantizationStyle::ScalarExpounded => remaining_bytes / 2,
+    };
+    budget.reserve_exact(&mut step_sizes, count)?;
 
     let irreversible = |val: u16| {
         let exponent = val >> 11;
@@ -961,7 +1062,7 @@ fn quantization_parameters(
         QuantizationStyle::NoQuantization => {
             // 8 bits per band (5 bits exponent, 3 bits reserved)
             for _ in 0..remaining_bytes {
-                let value = reader.read_byte()? as u16;
+                let value = reader.read_byte().ok_or(invalid)? as u16;
                 step_sizes.push(StepSize {
                     // Unused.
                     mantissa: 0,
@@ -970,20 +1071,20 @@ fn quantization_parameters(
             }
         }
         QuantizationStyle::ScalarDerived => {
-            let value = reader.read_u16()?;
+            let value = reader.read_u16().ok_or(invalid)?;
             step_sizes.push(irreversible(value));
         }
         QuantizationStyle::ScalarExpounded => {
             let num_bands = remaining_bytes / 2;
             for _ in 0..num_bands {
-                let value = reader.read_u16()?;
+                let value = reader.read_u16().ok_or(invalid)?;
 
                 step_sizes.push(irreversible(value));
             }
         }
     }
 
-    Some(QuantizationInfo {
+    Ok(QuantizationInfo {
         quantization_style,
         guard_bits: 0,
         step_sizes,

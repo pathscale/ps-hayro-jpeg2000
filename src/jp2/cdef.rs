@@ -1,20 +1,20 @@
 //! The channel definition box (cdef), defined in I.5.3.6.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::{FormatError, Result, bail};
-use crate::j2c::ComponentData;
+use crate::j2c::{BuildBudget, ComponentData};
 use crate::jp2::ImageBoxes;
 use crate::reader::BitReader;
 
-pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
+pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8], budget: &mut BuildBudget<'_>) -> Result<()> {
     let mut reader = BitReader::new(data);
     let count = reader.read_u16().ok_or(FormatError::InvalidBox)? as usize;
     if count == 0 || data.len() != 2 + count * 6 {
         bail!(FormatError::InvalidBox);
     }
-    let mut definitions = Vec::with_capacity(count);
+    let mut definitions = Vec::new();
+    budget.reserve_exact(&mut definitions, count)?;
 
     for _ in 0..count {
         let channel_index = reader.read_u16().ok_or(FormatError::InvalidBox)?;
@@ -29,7 +29,7 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
         });
     }
 
-    definitions.sort_by(|a, b| a.channel_index.cmp(&b.channel_index));
+    definitions.sort_unstable_by_key(|definition| definition.channel_index);
 
     // Ensure channel indices increases in steps of 1, starting from 0.
     for (idx, def) in definitions.iter().enumerate() {
@@ -38,9 +38,13 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
         }
     }
 
-    boxes.channel_definition = Some(ChannelDefinitionBox {
+    if let Some(old) = boxes.channel_definition.replace(ChannelDefinitionBox {
         channel_definitions: definitions,
-    });
+    }) {
+        budget.release_bytes(BuildBudget::bytes::<ChannelDefinition>(
+            old.channel_definitions.len(),
+        )?)?;
+    }
 
     Ok(())
 }
@@ -62,7 +66,9 @@ impl ChannelDefinitionBox {
 
     // Output index -> input channel index. Require a complete bijection,
     // with one whole-image opacity channel at most, placed after colours.
-    pub(crate) fn permutation(&self, component_count: usize) -> Result<Vec<usize>> {
+    pub(crate) fn permutation(
+        &self, component_count: usize, mut budget: BuildBudget<'_>,
+    ) -> Result<Vec<usize>> {
         if self.channel_definitions.len() != component_count {
             bail!(FormatError::InvalidBox);
         }
@@ -72,7 +78,9 @@ impl ChannelDefinitionBox {
             bail!(FormatError::InvalidBox);
         }
         let colours = component_count - alpha_count;
-        let mut permutation = vec![usize::MAX; component_count];
+        let mut permutation = Vec::new();
+        budget.reserve_exact(&mut permutation, component_count)?;
+        permutation.resize(component_count, usize::MAX);
         for definition in &self.channel_definitions {
             let source = definition.channel_index as usize;
             let destination = match definition.channel_type {
@@ -102,13 +110,21 @@ impl ChannelDefinitionBox {
         Ok(permutation)
     }
 
-    pub(crate) fn reorder(&self, components: &mut Vec<ComponentData>) -> Result<()> {
-        let permutation = self.permutation(components.len())?;
-        let mut sources: Vec<_> = core::mem::take(components).into_iter().map(Some).collect();
-        *components = permutation.into_iter().map(|source| {
-            // The validated permutation references every source exactly once.
-            sources[source].take().unwrap()
-        }).collect();
+    pub(crate) fn reorder(
+        &self, components: &mut [ComponentData], budget: BuildBudget<'_>,
+    ) -> Result<()> {
+        let mut permutation = self.permutation(components.len(), budget)?;
+        for start in 0..permutation.len() {
+            let mut current = start;
+            while permutation[current] != current {
+                let source = core::mem::replace(&mut permutation[current], current);
+                if source == start {
+                    break;
+                }
+                components.swap(current, source);
+                current = source;
+            }
+        }
         Ok(())
     }
 }
