@@ -3,12 +3,14 @@
 use alloc::vec::Vec;
 
 use crate::error::{FormatError, Result, bail};
+use crate::j2c::BuildBudget;
 use crate::jp2::ImageBoxes;
 use crate::reader::BitReader;
 
-pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
+pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8], budget: &mut BuildBudget<'_>) -> Result<()> {
     let mut reader = BitReader::new(data);
-    let mut entries = Vec::with_capacity(data.len() / 4);
+    let mut entries = Vec::new();
+    budget.reserve_exact(&mut entries, data.len() / 4)?;
 
     while !reader.at_end() {
         let component_index = reader.read_u16().ok_or(FormatError::InvalidBox)?;
@@ -29,7 +31,9 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
         });
     }
 
-    boxes.component_mapping = Some(ComponentMappingBox { entries });
+    if let Some(old) = boxes.component_mapping.replace(ComponentMappingBox { entries }) {
+        budget.release_bytes(BuildBudget::bytes::<ComponentMappingEntry>(old.entries.len())?)?;
+    }
 
     Ok(())
 }

@@ -5,10 +5,9 @@
 //! determines in which order the data appears in the codestream.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
-use alloc::vec;
 use alloc::vec::Vec;
 
+use super::build::BuildBudget;
 use super::codestream::{Header, ProgressionOrder};
 use super::tile::{ComponentTile, ResolutionTile, Tile};
 use crate::error::{DecodingError, Result};
@@ -107,27 +106,18 @@ impl<'a> IteratorInput<'a> {
             || self.components.0 >= self.components.1
     }
 
-    fn component_tiles(&self) -> Vec<ComponentTile<'a>> {
-        self.tile
-            .component_infos
-            .iter()
-            .map(|c| ComponentTile::new(self.tile, c))
-            .collect::<Vec<_>>()
+    fn component_tile(&self, component_idx: u8) -> ComponentTile<'a> {
+        ComponentTile::new(self.tile, &self.tile.component_infos[component_idx as usize])
     }
 
     /// The number of precincts of the given component at the given
     /// resolution, or 0 if the component doesn't have that resolution.
-    fn num_precincts(
-        &self,
-        component_tiles: &[ComponentTile<'a>],
-        component_idx: u8,
-        resolution: u8,
-    ) -> u64 {
+    fn num_precincts(&self, component_idx: u8, resolution: u8) -> u64 {
         if component_idx >= self.max_comp() || resolution >= self.max_resolution(component_idx) {
             return 0;
         }
 
-        ResolutionTile::new(component_tiles[component_idx as usize], resolution).num_precincts()
+        ResolutionTile::new(self.component_tile(component_idx), resolution).num_precincts()
     }
 }
 
@@ -136,7 +126,8 @@ impl<'a> IteratorInput<'a> {
 pub(crate) fn progression_iterator<'a>(
     tile: &'a Tile<'a>,
     header: &Header<'_>,
-) -> Result<Box<dyn Iterator<Item = ProgressionData> + 'a>> {
+    budget: &mut BuildBudget<'_>,
+) -> Result<(PacketIterator<'a>, bool)> {
     let progression_changes = if tile.progression_changes.is_empty() {
         &header.progression_changes
     } else {
@@ -144,73 +135,87 @@ pub(crate) fn progression_iterator<'a>(
     };
 
     if progression_changes.is_empty() {
-        return progression_order_iterator(IteratorInput::new(tile), tile.progression_order);
+        let iterator = progression_order_iterator(
+            IteratorInput::new(tile),
+            tile.progression_order,
+            budget,
+        )?;
+        return Ok((iterator, false));
     }
 
     let clamp = |value: u16| u8::try_from(value).unwrap_or(u8::MAX);
 
-    let iterators = progression_changes
-        .iter()
-        .map(|change| {
-            let input = IteratorInput::new_with_custom_bounds(
-                tile,
-                (change.resolution_start, change.resolution_end),
-                (0, clamp(change.layer_end)),
-                (clamp(change.component_start), clamp(change.component_end)),
-            );
+    let mut iterators = Vec::new();
+    budget.reserve_exact(&mut iterators, progression_changes.len())?;
+    for change in progression_changes {
+        let input = IteratorInput::new_with_custom_bounds(
+            tile,
+            (change.resolution_start, change.resolution_end),
+            (0, clamp(change.layer_end)),
+            (clamp(change.component_start), clamp(change.component_end)),
+        );
+        iterators.push(progression_order_iterator(input, change.progression_order, budget)?);
+    }
+    // Keep iterator storage live until packet parsing ends, including exhausted
+    // entries; the charged amount is shared with segment-record allocations.
+    let mut current = 0_usize;
+    let flattened = iter::from_fn(move || {
+        while let Some(iterator) = iterators.get_mut(current) {
+            if let Some(packet) = iterator.next() {
+                return Some(packet);
+            }
+            current += 1;
+        }
+        None
+    });
+    Ok((boxed_iterator(flattened, budget)?, true))
+}
 
-            progression_order_iterator(input, change.progression_order)
-        })
-        .collect::<Result<Vec<_>>>()?;
+pub(crate) type PacketIterator<'a> = Box<dyn Iterator<Item = ProgressionData> + 'a>;
 
-    // Each progression starts at layer 0, but packets that were already
-    // included by a previous progression must not be included again.
-    let mut included = BTreeSet::new();
-
-    Ok(Box::new(
-        iterators
-            .into_iter()
-            .flatten()
-            .filter(move |data| included.insert(*data)),
-    ))
+fn boxed_iterator<'a>(
+    iterator: impl Iterator<Item = ProgressionData> + 'a,
+    budget: &mut BuildBudget<'_>,
+) -> Result<PacketIterator<'a>> {
+    budget.charge_bytes(size_of_val(&iterator))?;
+    Ok(Box::new(iterator))
 }
 
 fn progression_order_iterator<'a>(
     input: IteratorInput<'a>,
     progression_order: ProgressionOrder,
-) -> Result<Box<dyn Iterator<Item = ProgressionData> + 'a>> {
-    Ok(match progression_order {
+    budget: &mut BuildBudget<'_>,
+) -> Result<PacketIterator<'a>> {
+    match progression_order {
         ProgressionOrder::LayerResolutionComponentPosition => {
-            Box::new(layer_resolution_component_position_progression(input))
+            boxed_iterator(layer_resolution_component_position_progression(input), budget)
         }
         ProgressionOrder::ResolutionLayerComponentPosition => {
-            Box::new(resolution_layer_component_position_progression(input))
+            boxed_iterator(resolution_layer_component_position_progression(input), budget)
         }
-        ProgressionOrder::ResolutionPositionComponentLayer => Box::new(
-            resolution_position_component_layer_progression(input)
-                .ok_or(DecodingError::InvalidProgressionIterator)?,
-        ),
-        ProgressionOrder::PositionComponentResolutionLayer => Box::new(
-            position_component_resolution_layer_progression(input)
-                .ok_or(DecodingError::InvalidProgressionIterator)?,
-        ),
-        ProgressionOrder::ComponentPositionResolutionLayer => Box::new(
-            component_position_resolution_layer_progression(input)
-                .ok_or(DecodingError::InvalidProgressionIterator)?,
-        ),
-    })
+        ProgressionOrder::ResolutionPositionComponentLayer => {
+            let iterator = resolution_position_component_layer_progression(input, budget)?;
+            boxed_iterator(iterator, budget)
+        }
+        ProgressionOrder::PositionComponentResolutionLayer => {
+            let iterator = position_component_resolution_layer_progression(input, budget)?;
+            boxed_iterator(iterator, budget)
+        }
+        ProgressionOrder::ComponentPositionResolutionLayer => {
+            let iterator = component_position_resolution_layer_progression(input, budget)?;
+            boxed_iterator(iterator, budget)
+        }
+    }
 }
 
 /// B.12.1.1 Layer-resolution level-component-position progression.
 pub(crate) fn layer_resolution_component_position_progression<'a>(
     input: IteratorInput<'a>,
 ) -> impl Iterator<Item = ProgressionData> + 'a {
-    let component_tiles = input.component_tiles();
-
     let mut layer = input.min_layer();
     let mut resolution = input.min_resolution();
     let mut component_idx = input.min_comp();
-    let mut num_precincts = input.num_precincts(&component_tiles, component_idx, resolution);
+    let mut num_precincts = input.num_precincts(component_idx, resolution);
     let mut precinct = 0;
 
     iter::from_fn(move || {
@@ -236,7 +241,7 @@ pub(crate) fn layer_resolution_component_position_progression<'a>(
                 }
             }
 
-            num_precincts = input.num_precincts(&component_tiles, component_idx, resolution);
+            num_precincts = input.num_precincts(component_idx, resolution);
         }
 
         let data = ProgressionData {
@@ -256,12 +261,10 @@ pub(crate) fn layer_resolution_component_position_progression<'a>(
 pub(crate) fn resolution_layer_component_position_progression<'a>(
     input: IteratorInput<'a>,
 ) -> impl Iterator<Item = ProgressionData> + 'a {
-    let component_tiles = input.component_tiles();
-
     let mut layer = input.min_layer();
     let mut resolution = input.min_resolution();
     let mut component_idx = input.min_comp();
-    let mut num_precincts = input.num_precincts(&component_tiles, component_idx, resolution);
+    let mut num_precincts = input.num_precincts(component_idx, resolution);
     let mut precinct = 0;
 
     iter::from_fn(move || {
@@ -287,7 +290,7 @@ pub(crate) fn resolution_layer_component_position_progression<'a>(
                 }
             }
 
-            num_precincts = input.num_precincts(&component_tiles, component_idx, resolution);
+            num_precincts = input.num_precincts(component_idx, resolution);
         }
 
         let data = ProgressionData {
@@ -312,26 +315,31 @@ pub(crate) fn resolution_layer_component_position_progression<'a>(
 // Note that the order of fields here is important!
 struct PrecinctStore {
     resolution: u8,
-    precinct_y: u32,
-    precinct_x: u32,
+    precinct_y: u64,
+    precinct_x: u64,
     component_idx: u8,
     precinct_idx: u64,
 }
 
 fn position_progression_common<'a>(
     input: IteratorInput<'a>,
-    sort: impl FnMut(&PrecinctStore, &PrecinctStore) -> Ordering,
-) -> Option<impl Iterator<Item = ProgressionData> + 'a> {
-    let component_tiles = input.component_tiles();
-    let mut elements = vec![];
+    budget: &mut BuildBudget<'_>,
+    sort: fn(&PrecinctStore, &PrecinctStore) -> Ordering,
+) -> Result<impl Iterator<Item = ProgressionData> + use<'a>> {
+    let mut elements = Vec::new();
 
     for component_idx in input.min_comp()..input.max_comp() {
-        let component_tile = component_tiles[component_idx as usize];
+        let component_tile = input.component_tile(component_idx);
 
         for resolution in input.min_resolution()..input.max_resolution(component_idx) {
             let resolution_tile = ResolutionTile::new(component_tile, resolution);
 
-            elements.extend(resolution_tile.precincts()?.map(|d| PrecinctStore {
+            let precincts = resolution_tile.precincts()
+                .ok_or(DecodingError::InvalidProgressionIterator)?;
+            let count = usize::try_from(resolution_tile.num_precincts())
+                .map_err(|_| crate::ValidationError::MemoryLimitExceeded)?;
+            budget.reserve(&mut elements, count)?;
+            elements.extend(precincts.map(|d| PrecinctStore {
                 precinct_y: d.r_y,
                 precinct_x: d.r_x,
                 component_idx,
@@ -341,9 +349,10 @@ fn position_progression_common<'a>(
         }
     }
 
-    elements.sort_by(sort);
+    // The key includes the unique (component, resolution, precinct) tuple.
+    elements.sort_unstable_by(sort);
 
-    Some(elements.into_iter().flat_map(move |e| {
+    Ok(elements.into_iter().flat_map(move |e| {
         (input.min_layer()..input.max_layer()).map(move |layer| ProgressionData {
             layer_num: layer,
             resolution: e.resolution,
@@ -356,8 +365,9 @@ fn position_progression_common<'a>(
 /// B.12.1.3 Resolution level-position-component-layer progression.
 pub(crate) fn resolution_position_component_layer_progression<'a>(
     input: IteratorInput<'a>,
-) -> Option<impl Iterator<Item = ProgressionData> + 'a> {
-    position_progression_common(input, |p, s| {
+    budget: &mut BuildBudget<'_>,
+) -> Result<impl Iterator<Item = ProgressionData> + use<'a>> {
+    position_progression_common(input, budget, |p, s| {
         p.resolution
             .cmp(&s.resolution)
             .then_with(|| p.precinct_y.cmp(&s.precinct_y))
@@ -370,8 +380,9 @@ pub(crate) fn resolution_position_component_layer_progression<'a>(
 /// B.12.1.4 Position-component-resolution level-layer progression.
 pub(crate) fn position_component_resolution_layer_progression<'a>(
     input: IteratorInput<'a>,
-) -> Option<impl Iterator<Item = ProgressionData> + 'a> {
-    position_progression_common(input, |p, s| {
+    budget: &mut BuildBudget<'_>,
+) -> Result<impl Iterator<Item = ProgressionData> + use<'a>> {
+    position_progression_common(input, budget, |p, s| {
         p.precinct_y
             .cmp(&s.precinct_y)
             .then_with(|| p.precinct_x.cmp(&s.precinct_x))
@@ -384,8 +395,9 @@ pub(crate) fn position_component_resolution_layer_progression<'a>(
 /// B.12.1.5 Component-position-resolution level-layer progression.
 pub(crate) fn component_position_resolution_layer_progression<'a>(
     input: IteratorInput<'a>,
-) -> Option<impl Iterator<Item = ProgressionData> + 'a> {
-    position_progression_common(input, |p, s| {
+    budget: &mut BuildBudget<'_>,
+) -> Result<impl Iterator<Item = ProgressionData> + use<'a>> {
+    position_progression_common(input, budget, |p, s| {
         p.component_idx
             .cmp(&s.component_idx)
             .then_with(|| p.precinct_y.cmp(&s.precinct_y))

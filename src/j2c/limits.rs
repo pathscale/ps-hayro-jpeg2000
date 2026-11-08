@@ -1,7 +1,7 @@
 //! Limits for component planes and reusable reconstruction buffers.
 
 use super::tile::{ResolutionTile, Tile};
-use super::Header;
+use super::{ComponentData, Header};
 use crate::error::{Result, ValidationError};
 use crate::DecodeSettings;
 
@@ -10,6 +10,7 @@ pub(crate) struct BufferSizes {
     pub(crate) coefficients: usize,
     pub(crate) output: usize,
     pub(crate) scratch: usize,
+    pub(crate) palette_bytes: usize,
     pub(crate) construction_base_bytes: usize,
 }
 
@@ -29,8 +30,9 @@ fn plane_size(samples: usize) -> Result<usize> {
 
 pub(crate) fn raw_plane_bytes(header: &Header<'_>, samples: usize) -> Result<usize> {
     let plane = plane_size(samples)?
-        .checked_mul(header.component_infos.len())
-        .and_then(|n| n.checked_mul(size_of::<f32>()))
+        .checked_mul(size_of::<f32>())
+        .and_then(|n| n.checked_add(size_of::<ComponentData>()))
+        .and_then(|n| n.checked_mul(header.component_infos.len()))
         .ok_or_else(memory_error)?;
     check_allocation_bytes(plane)?;
     Ok(plane)
@@ -105,6 +107,7 @@ impl BufferSizes {
             coefficients: 0,
             output: 0,
             scratch: 0,
+            palette_bytes: 0,
             construction_base_bytes: 0,
         };
         for tile in tiles {
@@ -135,8 +138,10 @@ impl BufferSizes {
             }
         }
         let planes = raw_plane_bytes(header, samples)?;
-        let palette_floats = samples
+        sizes.palette_bytes = samples
             .checked_add(crate::math::SIMD_WIDTH)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .and_then(|n| n.checked_add(size_of::<ComponentData>()))
             .and_then(|n| n.checked_mul(palette_components))
             .ok_or_else(memory_error)?;
         let reconstruction = sizes
@@ -147,12 +152,9 @@ impl BufferSizes {
         let reconstruction_bytes = reconstruction
             .checked_mul(size_of::<f32>())
             .ok_or_else(memory_error)?;
-        let palette_bytes = palette_floats
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(memory_error)?;
         let total = tile_bytes
             .checked_add(planes)
-            .and_then(|n| n.checked_add(palette_bytes))
+            .and_then(|n| n.checked_add(sizes.palette_bytes))
             .and_then(|n| n.checked_add(reconstruction_bytes))
             .ok_or_else(memory_error)?;
         check_total_bytes(total, settings)?;

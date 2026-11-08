@@ -2,8 +2,8 @@
 
 use alloc::vec::Vec;
 
-use crate::error::{FormatError, Result, bail};
-use crate::j2c::ComponentData;
+use crate::error::{DecodeError, FormatError, Result, ValidationError, bail};
+use crate::j2c::{BuildBudget, ComponentData};
 use crate::jp2::r#box::{FILE_TYPE, JP2_SIGNATURE};
 use crate::jp2::cdef::ChannelDefinitionBox;
 use crate::jp2::cmap::{ComponentMappingBox, ComponentMappingEntry, ComponentMappingType};
@@ -31,14 +31,13 @@ pub(crate) struct ImageBoxes {
 pub struct DecodedImage<'a> {
     /// The raw decoded JPEG2000 codestream components.
     pub(crate) decoded_components: &'a mut Vec<ComponentData>,
-    /// The JP2 boxes of the image. In the case of a raw codestream, we
-    /// will synthesize the necessary boxes.
-    pub(crate) boxes: ImageBoxes,
     /// Whether opacity samples describe premultiplied colour components.
     pub(crate) has_premultiplied_alpha: bool,
 }
 
 pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<Image<'a>> {
+    let byte_settings = settings;
+    let mut budget = BuildBudget::new(0, &byte_settings);
     let mut reader = BitReader::new(data);
     let signature_box = r#box::read(&mut reader).ok_or(FormatError::InvalidBox)?;
 
@@ -54,6 +53,8 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
 
     let mut image_boxes: Option<ImageBoxes> = None;
     let mut parsed_codestream = None;
+    let mut image_box_bytes = 0;
+    let mut codestream_bytes = 0;
 
     // Read boxes until we find the JP2 Header box
     while !reader.at_end() {
@@ -67,6 +68,9 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
 
         match current_box.box_type {
             r#box::JP2_HEADER => {
+                drop(image_boxes.take());
+                budget.release_bytes(image_box_bytes)?;
+                let before = budget.total();
                 let mut boxes = ImageBoxes::default();
 
                 let mut jp2h_reader = BitReader::new(current_box.data);
@@ -77,14 +81,20 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
 
                     match child_box.box_type {
                         r#box::CHANNEL_DEFINITION => {
-                            cdef::parse(&mut boxes, child_box.data)?;
+                            cdef::parse(&mut boxes, child_box.data, &mut budget)?;
                         }
                         r#box::COLOUR_SPECIFICATION => {
-                            colr::parse(&mut boxes, child_box.data)?;
+                            colr::parse(&mut boxes, child_box.data, &mut budget)?;
                         }
                         r#box::PALETTE => {
-                            if pclr::parse(&mut boxes, child_box.data).is_err() && settings.strict {
-                                bail!(FormatError::InvalidBox);
+                            let mut palette_budget = budget;
+                            match pclr::parse(&mut boxes, child_box.data, &mut palette_budget) {
+                                Ok(()) => budget = palette_budget,
+                                Err(error @ DecodeError::Validation(ValidationError::MemoryLimitExceeded)) => {
+                                    return Err(error);
+                                }
+                                Err(_) if settings.strict => bail!(FormatError::InvalidBox),
+                                Err(_) => {}
                             }
 
                             // If we have a palettized image, decoding at a
@@ -93,16 +103,25 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
                             settings.target_resolution = None;
                         }
                         r#box::COMPONENT_MAPPING => {
-                            cmap::parse(&mut boxes, child_box.data)?;
+                            cmap::parse(&mut boxes, child_box.data, &mut budget)?;
                         }
                         _ => {}
                     }
                 }
 
+                image_box_bytes = budget.total() - before;
                 image_boxes = Some(boxes);
             }
             r#box::CONTIGUOUS_CODESTREAM => {
-                parsed_codestream = Some(crate::j2c::parse_raw(current_box.data, &settings)?);
+                drop(parsed_codestream.take());
+                budget.release_bytes(codestream_bytes)?;
+                let before = budget.total();
+                parsed_codestream = Some(crate::j2c::parse_raw(
+                    current_box.data,
+                    &settings,
+                    &mut budget,
+                )?);
+                codestream_bytes = budget.total() - before;
             }
             _ => {}
         }
@@ -117,23 +136,28 @@ pub(crate) fn parse<'a>(data: &'a [u8], mut settings: DecodeSettings) -> Result<
         // In theory, a cmap is required if we have pclr, but since there are
         // some files that don't seem to do so, we assume
         // that all channels are mapped via the palette in case not.
-        let mappings = (0..palette.columns.len())
-            .map(|i| ComponentMappingEntry {
-                component_index: 0,
-                mapping_type: ComponentMappingType::Palette { column: i as u8 },
-            })
-            .collect::<Vec<_>>();
+        let mut mappings = Vec::new();
+        budget.reserve_exact(&mut mappings, palette.columns.len())?;
+        mappings.extend((0..palette.columns.len()).map(|i| ComponentMappingEntry {
+            component_index: 0,
+            mapping_type: ComponentMappingType::Palette { column: i as u8 },
+        }));
 
         image_boxes.component_mapping = Some(ComponentMappingBox { entries: mappings });
     }
 
-    let (color_space, has_alpha) =
-        resolve_alpha_and_color_space(&image_boxes, &parsed_codestream.header, &settings)?;
+    let (color_space, has_alpha) = resolve_alpha_and_color_space(
+        &image_boxes,
+        &parsed_codestream.header,
+        &settings,
+        &mut budget,
+    )?;
 
     Ok(Image {
         codestream: parsed_codestream.data,
         header: parsed_codestream.header,
         boxes: image_boxes,
+        metadata_bytes: budget.total(),
         settings,
         color_space,
         has_alpha,

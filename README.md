@@ -18,7 +18,7 @@ Changes in this fork:
 - Raw four-component streams preserve four colour channels without assumed alpha.
 - Validated CDEF permutations that move planes, with premultiplied opacity reported.
 - Interleaved u8 and u16 output, scaled per component, rounded and clamped.
-- Finite pixel and reconstruction-buffer limits, checked before plane allocation.
+- Finite pixel and estimated heap limits for parsing and decoding.
 - Shared ICC profile bytes and borrowed input for single-segment code blocks.
 
 Packed unsigned output biases signed component ranges to unsigned. Planar
@@ -26,10 +26,11 @@ Packed unsigned output biases signed component ranges to unsigned. Planar
 Only a JP2 CDEF marks opacity; `has_premultiplied_alpha()` reports its representation.
 Raw colour interpretation remains the embedder's responsibility.
 
-`DecodeSettings` defaults to at most 2^28 decoded pixels and 2 GiB for component
-planes, coefficients, IDWT output and scratch, and palette expansion planes.
-The byte limit excludes compressed input, packet metadata, code-block scratch,
-and packed output allocated by the caller.
+`DecodeSettings` defaults to at most 2^28 decoded pixels and 2 GiB of estimated
+heap payload for parsing and decoding, including metadata, progression and
+code-block workspace, component planes, reconstruction, and palette expansion.
+The estimate excludes borrowed compressed input, unused collection capacity,
+allocator overhead, and separately requested packed output.
 
 `hayro-jpeg2000` can decode both raw JPEG 2000 codestreams (`.j2c`) and images wrapped
 inside the JP2 container format. The decoder supports the vast majority of features

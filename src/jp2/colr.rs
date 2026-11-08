@@ -3,10 +3,11 @@
 use alloc::sync::Arc;
 
 use crate::error::{FormatError, Result};
+use crate::j2c::BuildBudget;
 use crate::jp2::ImageBoxes;
 use crate::reader::BitReader;
 
-pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
+pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8], budget: &mut BuildBudget<'_>) -> Result<()> {
     if boxes.color_specification.is_some() {
         // "A JP2 file may contain multiple Colour Specification boxes, but
         // must contain at least one, specifying different methods
@@ -34,8 +35,9 @@ pub(crate) fn parse(boxes: &mut ImageBoxes, data: &[u8]) -> Result<()> {
             )
         }
         2 => {
-            let profile_data = Arc::from(reader.tail().ok_or(FormatError::InvalidBox)?);
-            ColorSpace::Icc(profile_data)
+            let profile_data = reader.tail().ok_or(FormatError::InvalidBox)?;
+            budget.charge::<u8>(profile_data.len())?;
+            ColorSpace::Icc(Arc::from(profile_data))
         }
         _ => ColorSpace::Unknown,
     };

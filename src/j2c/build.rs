@@ -7,12 +7,12 @@ use super::tag_tree::TagTree;
 use super::tile::{ResolutionTile, Tile};
 use crate::DecodeSettings;
 use crate::error::{DecodingError, Result, ValidationError};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::iter;
 use core::ops::Range;
 
-/// Tracks the estimated bytes for the current tile's construction entries.
+/// Tracks the estimated live payload bytes for a decoding phase.
+#[derive(Clone, Copy)]
 pub(crate) struct BuildBudget<'a> {
     total_bytes: usize,
     settings: &'a DecodeSettings,
@@ -27,13 +27,67 @@ impl<'a> BuildBudget<'a> {
     }
 
     pub(crate) fn reserve<T>(&mut self, values: &mut Vec<T>, additional: usize) -> Result<()> {
+        self.reserve_entries(values, additional, false)
+    }
+
+    pub(crate) fn reserve_exact<T>(&mut self, values: &mut Vec<T>, additional: usize) -> Result<()> {
+        self.reserve_entries(values, additional, true)
+    }
+
+    fn reserve_entries<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        additional: usize,
+        exact: bool,
+    ) -> Result<()> {
         let error = ValidationError::MemoryLimitExceeded;
-        let added_bytes = additional.checked_mul(size_of::<T>()).ok_or(error)?;
-        let total = self.total_bytes.checked_add(added_bytes).ok_or(error)?;
+        let mut next = *self;
+        next.charge::<T>(additional)?;
+        let reserved = if exact {
+            values.try_reserve_exact(additional)
+        } else {
+            values.try_reserve(additional)
+        };
+        reserved.map_err(|_| error)?;
+        *self = next;
+        Ok(())
+    }
+
+    pub(crate) fn charge<T>(&mut self, count: usize) -> Result<()> {
+        self.charge_bytes(Self::bytes::<T>(count)?)
+    }
+
+    pub(crate) fn charge_bytes(&mut self, bytes: usize) -> Result<()> {
+        let total = self.total_bytes
+            .checked_add(bytes)
+            .ok_or(ValidationError::MemoryLimitExceeded)?;
         check_total_bytes(total, self.settings)?;
-        values.try_reserve(additional).map_err(|_| error)?;
         self.total_bytes = total;
         Ok(())
+    }
+
+    pub(crate) fn bytes<T>(count: usize) -> Result<usize> {
+        count
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| ValidationError::MemoryLimitExceeded.into())
+    }
+
+    pub(crate) fn total(self) -> usize {
+        self.total_bytes
+    }
+
+    pub(crate) fn release_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.total_bytes = self.total_bytes
+            .checked_sub(bytes)
+            .ok_or(ValidationError::MemoryLimitExceeded)?;
+        Ok(())
+    }
+
+    pub(crate) fn copy_slice<T: Copy>(&mut self, values: &[T]) -> Result<Vec<T>> {
+        let mut copy = Vec::new();
+        self.reserve_exact(&mut copy, values.len())?;
+        copy.extend_from_slice(values);
+        Ok(copy)
     }
 }
 
@@ -71,7 +125,7 @@ pub(crate) fn build(
     tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
     skipped_resolution_levels: u8,
-    mut budget: BuildBudget<'_>,
+    budget: &mut BuildBudget<'_>,
 ) -> Result<()> {
     let mut max_coefficients = 0;
     for component_tile in tile.component_tiles() {
@@ -83,12 +137,8 @@ pub(crate) fn build(
         max_coefficients = max_coefficients.max(samples);
     }
 
-    if storage.coefficients.is_empty() {
-        // Fast path that requests pre-zeroed memory from the OS where available.
-        storage.coefficients = vec![0.0; max_coefficients];
-    } else {
-        storage.coefficients.resize(max_coefficients, 0.0);
-    }
+    // BufferSizes preflights and allocates the largest tile before construction.
+    storage.coefficients.resize(max_coefficients, 0.0);
 
     for component_tile in tile.component_tiles() {
         let mut coefficient_counter = 0_usize;
@@ -132,14 +182,14 @@ pub(crate) fn build(
         // Resolution 0 always is the LL sub-band.
         let ll_resolution_tile = resolution_tiles.next().unwrap();
         let first_ll_sub_band =
-            build_sub_band(SubBandType::LowLow, &ll_resolution_tile, storage, &mut budget)?;
+            build_sub_band(SubBandType::LowLow, &ll_resolution_tile, storage, budget)?;
 
         for resolution_tile in resolution_tiles {
             let decomposition = Decomposition {
                 sub_bands: [
-                    build_sub_band(SubBandType::HighLow, &resolution_tile, storage, &mut budget)?,
-                    build_sub_band(SubBandType::LowHigh, &resolution_tile, storage, &mut budget)?,
-                    build_sub_band(SubBandType::HighHigh, &resolution_tile, storage, &mut budget)?,
+                    build_sub_band(SubBandType::HighLow, &resolution_tile, storage, budget)?,
+                    build_sub_band(SubBandType::LowHigh, &resolution_tile, storage, budget)?,
+                    build_sub_band(SubBandType::HighHigh, &resolution_tile, storage, budget)?,
                 ],
                 rect: resolution_tile.rect,
             };
@@ -185,12 +235,12 @@ fn build_precincts(
 
         // See Figure B.9. Conceptually, the area of code-blocks is aligned
         // to the width/height of a code block.
-        let cb_x0 = (u32::max(precinct_rect.x0, sub_band_rect.x0) / cb_width) * cb_width;
-        let cb_y0 = (u32::max(precinct_rect.y0, sub_band_rect.y0) / cb_height) * cb_height;
-        let cb_x1 = (u32::min(precinct_rect.x1, sub_band_rect.x1).div_ceil(cb_width)) * cb_width;
-        let cb_y1 = (u32::min(precinct_rect.y1, sub_band_rect.y1).div_ceil(cb_height)) * cb_height;
-
-        let code_block_area = IntRect::from_ltrb(cb_x0, cb_y0, cb_x1, cb_y1);
+        // Keep the aligned bounds in block units. The exclusive end in
+        // coefficient units can exceed u32::MAX for the final partial block.
+        let cb_x0 = precinct_rect.x0.max(sub_band_rect.x0) / cb_width;
+        let cb_y0 = precinct_rect.y0.max(sub_band_rect.y0) / cb_height;
+        let cb_x1 = precinct_rect.x1.min(sub_band_rect.x1).div_ceil(cb_width);
+        let cb_y1 = precinct_rect.y1.min(sub_band_rect.y1).div_ceil(cb_height);
 
         // If the sub-band is empty, there are no code-blocks, but due to our
         // flooring/ceiling above, we would get 1 code-block in each direction.
@@ -198,17 +248,17 @@ fn build_precincts(
         let code_blocks_x = if sub_band_rect.width() == 0 {
             0
         } else {
-            code_block_area.width() / cb_width
+            cb_x1.saturating_sub(cb_x0)
         };
 
         let code_blocks_y = if sub_band_rect.height() == 0 {
             0
         } else {
-            code_block_area.height() / cb_height
+            cb_y1.saturating_sub(cb_y0)
         };
 
         let blocks = build_code_blocks(
-            code_block_area,
+            (cb_x0, cb_y0),
             sub_band_rect,
             resolution_tile,
             code_blocks_x,
@@ -235,6 +285,7 @@ fn build_precincts(
             code_blocks: blocks,
             code_inclusion_tree,
             zero_bitplane_tree,
+            visited_layers: 0,
         });
     }
 
@@ -244,7 +295,7 @@ fn build_precincts(
 }
 
 fn build_code_blocks(
-    code_block_area: IntRect,
+    (block_x0, block_y0): (u32, u32),
     sub_band_rect: IntRect,
     tile_instance: &ResolutionTile<'_>,
     code_blocks_x: u32,
@@ -261,23 +312,27 @@ fn build_code_blocks(
     budget.reserve(&mut storage.code_blocks, block_count)?;
     budget.reserve(&mut storage.layers, layer_count)?;
 
-    let mut y = code_block_area.y0;
-
     let code_block_width = tile_instance.code_block_width();
     let code_block_height = tile_instance.code_block_height();
 
     let start = storage.code_blocks.len();
 
     for y_idx in 0..code_blocks_y {
-        let mut x = code_block_area.x0;
+        let y = (block_y0 + y_idx) * code_block_height;
 
         for x_idx in 0..code_blocks_x {
+            let x = (block_x0 + x_idx) * code_block_width;
             // "Code-blocks in the partition may extend beyond the boundaries of
             // the sub-band coefficients. When this happens, only the
             // coefficients lying within the sub-band are coded using the method
             // described in Annex D."
-            let area = IntRect::from_xywh(x, y, code_block_width, code_block_height)
-                .intersect(sub_band_rect);
+            let area = IntRect::from_ltrb(
+                x,
+                y,
+                x.saturating_add(code_block_width),
+                y.saturating_add(code_block_height),
+            )
+            .intersect(sub_band_rect);
 
             let start = storage.layers.len();
             storage.layers.extend(iter::repeat_n(
@@ -301,11 +356,7 @@ fn build_code_blocks(
                 layers: start..end,
                 non_empty_layer_count: 0,
             });
-
-            x += code_block_width;
         }
-
-        y += code_block_height;
     }
 
     let end = storage.code_blocks.len();
@@ -341,13 +392,15 @@ pub(crate) struct Precinct {
     pub(crate) code_blocks: Range<usize>,
     pub(crate) code_inclusion_tree: TagTree,
     pub(crate) zero_bitplane_tree: TagTree,
+    /// POC duplicate suppression uses the first sub-band's precinct.
+    pub(crate) visited_layers: u32,
 }
 
 pub(crate) struct PrecinctData {
     /// The x coordinate mapped back to the reference grid.
-    pub(crate) r_x: u32,
+    pub(crate) r_x: u64,
     /// The y coordinate mapped back to the reference grid.
-    pub(crate) r_y: u32,
+    pub(crate) r_y: u64,
     /// The actual rectangle of the precinct (in the sub-band coordinate
     /// system).
     pub(crate) rect: IntRect,
