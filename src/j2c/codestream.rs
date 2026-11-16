@@ -838,8 +838,6 @@ fn ppm_marker<'a>(
     let mut reader = BitReader::new(ppm_data);
     let sequence_idx = reader.read_byte().ok_or(invalid)?;
 
-    // TODO: Handle case where next packet doesn't have nppm parameter.
-
     while !reader.at_end() {
         let packet_len = reader.read_u16().ok_or(invalid)? as usize;
         let data = reader.read_bytes(packet_len).ok_or(invalid)?;
